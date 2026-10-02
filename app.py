@@ -8,7 +8,11 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 DB = "credito_empresarial.db"
-CNPJ_API = "https://brasilapi.com.br/cnpj/v1/{}"
+CNPJ_APIS = [
+    ("BrasilAPI / Minha Receita", "https://brasilapi.com.br/api/cnpj/v1/{}"),
+    ("CNPJ.ws", "https://publica.cnpj.ws/cnpj/{}"),
+    ("ReceitaWS", "https://www.receitaws.com.br/v1/cnpj/{}"),
+]
 
 SEGMENTOS = {
     "Comércio": {"fator": .10, "prazo": 28},
@@ -75,17 +79,23 @@ def extract_partners(data):
     qsa = data.get("qsa") or data.get("socios") or []
     return len(qsa) if isinstance(qsa, list) else 0
 
-def lookup_cnpj(cnpj):
-    clean = normalize_cnpj(cnpj)
-    r = requests.get(CNPJ_API.format(clean), timeout=15)
-    if r.status_code == 404:
-        raise ValueError("CNPJ não encontrado na fonte de consulta.")
-    if r.status_code >= 400:
-        raise ValueError(f"A consulta retornou HTTP {r.status_code}.")
-    data = r.json()
+def _text(v):
+    return "" if v is None else str(v).strip()
+
+def _float(v):
+    try:
+        if v is None or v == "": return 0.0
+        if isinstance(v, (int, float)): return float(v)
+        return float(str(v).replace(".", "").replace(",", ".")) if "," in str(v) else float(v)
+    except Exception:
+        return 0.0
+
+def _join_address(*parts):
+    return ", ".join(_text(x) for x in parts if _text(x))
+
+def _map_brasilapi(data, clean):
     abertura = data.get("data_inicio_atividade") or data.get("data_abertura") or data.get("data_abertura_empresa")
-    endereco_parts = [data.get("logradouro"), data.get("numero"), data.get("complemento"), data.get("bairro")]
-    endereco = ", ".join(str(x) for x in endereco_parts if x)
+    endereco = _join_address(data.get("logradouro"), data.get("numero"), data.get("complemento"), data.get("bairro"), data.get("cep"))
     cnae = data.get("cnae_fiscal_descricao") or data.get("cnae_fiscal") or ""
     return {
         "cnpj": data.get("cnpj") or clean,
@@ -93,8 +103,8 @@ def lookup_cnpj(cnpj):
         "fantasia": data.get("nome_fantasia") or "",
         "abertura": abertura or "",
         "situacao": (data.get("descricao_situacao_cadastral") or data.get("situacao_cadastral") or "").upper(),
-        "capital": extract_capital(data),
-        "socios": extract_partners(data),
+        "capital": _float(data.get("capital_social")),
+        "socios": len(data.get("qsa") or []) if isinstance(data.get("qsa") or [], list) else 0,
         "porte": data.get("porte") or "",
         "natureza": data.get("natureza_juridica") or "",
         "cnae": str(cnae),
@@ -103,6 +113,90 @@ def lookup_cnpj(cnpj):
         "uf": data.get("uf") or "",
         "fonte": "BrasilAPI / Minha Receita",
     }
+
+def _map_cnpjws(data, clean):
+    est = data.get("estabelecimento") or {}
+    porte = data.get("porte") or {}
+    natureza = data.get("natureza_juridica") or {}
+    principal = est.get("atividade_principal") or {}
+    cnae = _join_address(principal.get("id"), principal.get("descricao"))
+    endereco = _join_address(
+        est.get("tipo_logradouro"), est.get("logradouro"), est.get("numero"),
+        est.get("complemento"), est.get("bairro"), est.get("cep")
+    )
+    return {
+        "cnpj": est.get("cnpj") or clean,
+        "razao": data.get("razao_social") or "",
+        "fantasia": est.get("nome_fantasia") or "",
+        "abertura": est.get("data_inicio_atividade") or "",
+        "situacao": _text(est.get("situacao_cadastral")).upper(),
+        "capital": _float(data.get("capital_social")),
+        "socios": len(data.get("socios") or []) if isinstance(data.get("socios") or [], list) else 0,
+        "porte": porte.get("descricao") if isinstance(porte, dict) else _text(porte),
+        "natureza": natureza.get("descricao") if isinstance(natureza, dict) else _text(natureza),
+        "cnae": cnae,
+        "endereco": endereco,
+        "municipio": (est.get("cidade") or {}).get("nome", "") if isinstance(est.get("cidade"), dict) else "",
+        "uf": (est.get("estado") or {}).get("sigla", "") if isinstance(est.get("estado"), dict) else "",
+        "fonte": "CNPJ.ws",
+    }
+
+def _map_receitaws(data, clean):
+    atividade = data.get("atividade_principal") or []
+    cnae = ""
+    if isinstance(atividade, list) and atividade:
+        cnae = _join_address(atividade[0].get("code"), atividade[0].get("text"))
+    endereco = _join_address(data.get("logradouro"), data.get("numero"), data.get("complemento"), data.get("bairro"), data.get("cep"))
+    qsa = data.get("qsa") or []
+    return {
+        "cnpj": data.get("cnpj") or clean,
+        "razao": data.get("nome") or "",
+        "fantasia": data.get("fantasia") or "",
+        "abertura": data.get("abertura") or "",
+        "situacao": _text(data.get("situacao")).upper(),
+        "capital": _float(data.get("capital_social")),
+        "socios": len(qsa) if isinstance(qsa, list) else 0,
+        "porte": data.get("porte") or "",
+        "natureza": data.get("natureza_juridica") or "",
+        "cnae": cnae,
+        "endereco": endereco,
+        "municipio": data.get("municipio") or "",
+        "uf": data.get("uf") or "",
+        "fonte": "ReceitaWS",
+    }
+
+def lookup_cnpj(cnpj):
+    clean = normalize_cnpj(cnpj)
+    if not cnpj_ok(clean):
+        raise ValueError("CNPJ inválido. Informe 14 caracteres (números ou, no novo padrão, letras/números).")
+
+    erros = []
+    for nome, url in CNPJ_APIS:
+        # CNPJ.ws e ReceitaWS aceitam apenas o padrão numérico tradicional.
+        if not clean.isdigit() and nome != "BrasilAPI / Minha Receita":
+            continue
+        try:
+            r = requests.get(url.format(clean), timeout=15, headers={"User-Agent": "FratelliCredito/3.1"})
+            if r.status_code == 200:
+                data = r.json()
+                if nome == "BrasilAPI / Minha Receita": result = _map_brasilapi(data, clean)
+                elif nome == "CNPJ.ws": result = _map_cnpjws(data, clean)
+                else: result = _map_receitaws(data, clean)
+                if result.get("razao") or result.get("situacao"):
+                    return result
+                erros.append(f"{nome}: resposta sem dados empresariais")
+            elif r.status_code == 404:
+                erros.append(f"{nome}: CNPJ não localizado na base/cache")
+            elif r.status_code == 429:
+                erros.append(f"{nome}: limite de consultas atingido")
+            else:
+                erros.append(f"{nome}: HTTP {r.status_code}")
+        except requests.RequestException as e:
+            erros.append(f"{nome}: falha de conexão")
+        except ValueError:
+            erros.append(f"{nome}: resposta inválida")
+
+    raise ValueError("Não foi possível obter os dados cadastrais nas fontes disponíveis. " + " | ".join(erros))
 
 def calc(data):
     w=cfg(); abertura=parse_date(data.get("abertura")) or date.today()
