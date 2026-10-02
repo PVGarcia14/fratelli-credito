@@ -17,7 +17,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.3", page_icon="💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.4", page_icon="💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -286,19 +286,34 @@ def behavior_from_real_history(df):
 def limit_engine(score, risk_level, monthly_revenue, segment, history_12m,
                  on_time, open_amount, current_limit, requested_order):
     """
-    Transparent limit engine:
-    1) capacity ceiling from monthly revenue;
-    2) behavior factor from real payment history;
-    3) current exposure deducted;
-    4) hard caps by risk/segment.
+    Motor 4.4:
+    - calcula limite recomendado a partir da capacidade;
+    - aplica risco e comportamento como moderadores;
+    - NÃO subtrai o limite atual, evitando dupla contagem;
+    - desconta somente a exposição efetivamente em aberto;
+    - calcula utilização antes/depois do pedido.
     """
     if score is None or risk_level in ("ELEVADO", "NÃO CLASSIFICADO"):
-        return 0.0, 0.0, "Sem limite automático por risco/dados."
+        return {
+            "recommended": 0.0, "available": 0.0, "post_order": 0.0,
+            "utilization_before": None, "utilization_after": None,
+            "reason": "Sem limite automático por risco/dados."
+        }
+
+    monthly_revenue = float(monthly_revenue or 0)
+    history_12m = float(history_12m or 0)
+    open_amount = max(0.0, float(open_amount or 0))
+    requested_order = max(0.0, float(requested_order or 0))
+
     if monthly_revenue <= 0:
         if history_12m > 0 and (on_time is None or on_time >= 90):
             base = min(5000.0, history_12m * 0.50)
         else:
-            return 0.0, 0.0, "Sem faturamento/capacidade financeira suficiente."
+            return {
+                "recommended": 0.0, "available": 0.0, "post_order": 0.0,
+                "utilization_before": None, "utilization_after": None,
+                "reason": "Sem faturamento/capacidade financeira suficiente."
+            }
     else:
         factor = SEGMENT_FACTORS.get(segment, .05)
         base = monthly_revenue * factor
@@ -308,18 +323,52 @@ def limit_engine(score, risk_level, monthly_revenue, segment, history_12m,
     else:
         base = min(base, 30000.0)
 
-    # Behavior modifier is deliberately modest: history cannot overpower capacity.
     if history_12m > 0 and on_time is not None:
-        if on_time >= 97: base *= 1.00
-        elif on_time >= 90: base *= 0.90
-        elif on_time >= 80: base *= 0.70
-        else: base *= 0.40
+        if on_time >= 97:
+            behavior_factor = 1.00
+        elif on_time >= 90:
+            behavior_factor = 0.90
+        elif on_time >= 80:
+            behavior_factor = 0.70
+        else:
+            behavior_factor = 0.40
+        base *= behavior_factor
 
-    # Existing exposure reduces available credit.
-    available = max(0.0, round(base - open_amount - current_limit, -2))
     recommended = max(0.0, round(base, -2))
-    reason = "Capacidade + histórico + exposição."
-    return recommended, available, reason
+    available = max(0.0, round(recommended - open_amount, -2))
+    utilization_before = None if recommended <= 0 else round(open_amount / recommended * 100, 1)
+    post_exposure = open_amount + requested_order
+    utilization_after = None if recommended <= 0 else round(post_exposure / recommended * 100, 1)
+    post_order = max(0.0, round(recommended - post_exposure, -2))
+
+    reason = (
+        "Capacidade financeira + risco + comportamento + exposição. "
+        "O limite atual é apenas informativo; somente a exposição em aberto reduz o limite disponível."
+    )
+    return {
+        "recommended": recommended,
+        "available": available,
+        "post_order": post_order,
+        "utilization_before": utilization_before,
+        "utilization_after": utilization_after,
+        "reason": reason
+    }
+
+
+def order_decision(available, requested_order, gate, risk_level):
+    """Decisão financeira do pedido, separada da condição comercial."""
+    requested_order = max(0.0, float(requested_order or 0))
+    available = max(0.0, float(available or 0))
+
+    if gate in ("BLOQUEADO", "PENDENTE", "REVISÃO MANUAL"):
+        return gate, 0.0
+    if requested_order <= 0:
+        return "SEM PEDIDO INFORMADO", 0.0
+    if requested_order <= available:
+        return "APROVAÇÃO INTEGRAL", requested_order
+    if risk_level == "CONTROLADO" and available > 0:
+        return "APROVAÇÃO PARCIAL", available
+    return "NÃO APROVADO PARA ESTE PEDIDO", 0.0
 
 
 def pdf_report(data, path):
@@ -342,8 +391,8 @@ def pdf_report(data, path):
 
 con = db()
 
-st.title("Fratelli Crédito 4.3")
-st.caption("Análise empresarial para decisão de crédito — dados ausentes são excluídos do cálculo.")
+st.title("Fratelli Crédito 4.4")
+st.caption("Motor de crédito B2B — dados ausentes são excluídos do cálculo; o limite financeiro é separado da exposição atual.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
@@ -461,17 +510,19 @@ if menu == "Nova análise":
     )
 
     limite = limit_credit(score,faturamento if faturamento>0 else None,segmento,compras_12m,atrasos,pontualidade if tem_pontualidade and pontualidade is not None else None)
-    limite_motor, disponivel_motor, limite_motivo = limit_engine(
+    motor = limit_engine(
         score, risco, faturamento, segmento, compras_12m,
         pontualidade if pontualidade is not None else None,
         aberto, limite_atual, pedido
     )
-    # 4.3 uses the transparent engine when it has enough inputs.
-    if limite_motor > 0 or risco in ("ELEVADO","NÃO CLASSIFICADO"):
-        limite = limite_motor
-        disponivel = disponivel_motor
-    else:
-        disponivel = max(0, limite - aberto)
+    limite = motor["recommended"]
+    disponivel = motor["available"]
+    limite_motivo = motor["reason"]
+
+    decisao_financeira, valor_aprovado = order_decision(
+        disponivel, pedido, gate, risco
+    )
+
     prazo, entrada, decisao = conditions(risco,disponivel,pedido)
     if gate == "BLOQUEADO":
         decisao = "NÃO APROVADO"
@@ -479,6 +530,12 @@ if menu == "Nova análise":
     elif gate in ("REVISÃO MANUAL", "PENDENTE"):
         decisao = gate
         prazo, entrada = "Revisão manual / pendente", 0
+    elif decisao_financeira == "APROVAÇÃO PARCIAL":
+        decisao = "APROVAÇÃO PARCIAL"
+        prazo, entrada = "Revisão/condição comercial", 0
+    elif decisao_financeira == "NÃO APROVADO PARA ESTE PEDIDO":
+        decisao = decisao_financeira
+        prazo, entrada = "À vista", 0
 
 
     st.divider()
@@ -492,10 +549,36 @@ if menu == "Nova análise":
     st.write(f"**Controle de decisão:** {gate} — {gate_reason}")
 
 
-    st.write(f"**Limite disponível para este pedido:** {money(disponivel)}")
+    st.write(f"**Limite aprovado total:** {money(limite)}")
+    st.write(f"**Exposição atual:** {money(aberto)}")
+    st.write(f"**Limite disponível antes do pedido:** {money(disponivel)}")
+    st.write(f"**Pedido solicitado:** {money(pedido)}")
+    st.write(f"**Valor financeiro aprovado:** {money(valor_aprovado)}")
+    if motor["utilization_before"] is not None:
+        st.write(f"**Utilização antes do pedido:** {motor['utilization_before']:.1f}%")
+        st.write(f"**Utilização após o pedido:** {motor['utilization_after']:.1f}%")
     st.caption(f"Motor de limite: {limite_motivo}")
+    st.write(f"**Decisão financeira:** {decisao_financeira}")
     st.write(f"**Condição sugerida:** {prazo}  |  **Entrada:** {money(entrada)}")
-    st.write(f"**Decisão:** {decisao}")
+    st.write(f"**Decisão final:** {decisao}")
+
+    with st.expander("Simulação financeira do pedido"):
+        st.markdown(
+            "Simule o impacto de um pedido usando apenas o valor financeiro. "
+            "O motor de risco não presume produto, preço, desconto ou embalagem."
+        )
+        sim_pedido = st.number_input(
+            "Valor financeiro simulado do pedido (R$)",
+            min_value=0.0, value=float(pedido or 0), step=100.0,
+            key="sim_pedido_44"
+        )
+        sim_decisao, sim_aprovado = order_decision(
+            disponivel, sim_pedido, gate, risco
+        )
+        sim_pos = max(0.0, disponivel - sim_pedido)
+        st.metric("Valor aprovado na simulação", money(sim_aprovado))
+        st.write(f"**Resultado:** {sim_decisao}")
+        st.write(f"**Saldo disponível após a simulação:** {money(sim_pos)}")
 
     with st.expander("Ver composição do score"):
         for k,v in itens.items():
@@ -536,9 +619,14 @@ if menu == "Nova análise":
             pdf_report([
                 ("CNPJ",cnpj_clean),("Razão social",razao),("Segmento",segmento),
                 ("Score","N/D" if score is None else score),("Cobertura",f"{cobertura}%"),
-                ("Risco",risco),("Limite recomendado",money(limite)),
-                ("Limite disponível",money(disponivel)),("Pedido",money(pedido)),
-                ("Prazo sugerido",prazo),("Entrada",money(entrada)),("Decisão",decisao)
+                ("Risco",risco),("Limite aprovado total",money(limite)),
+                ("Exposição atual",money(aberto)),
+                ("Limite disponível",money(disponivel)),
+                ("Pedido solicitado",money(pedido)),
+                ("Valor aprovado",money(valor_aprovado)),
+                ("Decisão financeira",decisao_financeira),
+                ("Prazo sugerido",prazo),("Entrada",money(entrada)),
+                ("Decisão final",decisao)
             ],pdf)
             with open(pdf,"rb") as f:
                 st.download_button("Baixar relatório PDF",f,file_name=pdf.name)
@@ -597,16 +685,16 @@ elif menu == "Clientes":
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
 else:
-    st.subheader("Metodologia 4.2")
+    st.subheader("Metodologia 4.4")
     st.markdown("""
 **Regra central:** informação ausente não é boa nem ruim. Ela é excluída do cálculo.
 
 **Pesos**
 - Cadastro e estabilidade: 20%
 - Capacidade financeira: 25%
-- Histórico de pagamento: 20%
+- Histórico de pagamento: 30%
 - Exposição: 15%
-- Comportamento operacional: 20%
+- Comportamento operacional: 10%
 
 **Cobertura:** mostra quanto da política total pôde ser efetivamente analisado.
 
@@ -616,11 +704,11 @@ else:
 
 **Restrições:** somente entram no cálculo quando a consulta foi efetivamente confirmada e registrada.
 
-**Decisão:** o sistema separa risco, limite disponível e condição comercial sugerida.
+**Decisão:** o sistema separa risco, limite aprovado total, exposição, limite disponível, valor solicitado, valor aprovado e decisão financeira. Parâmetros comerciais específicos ficam fora do motor de risco.
 
 **Histórico real:** vendas, pagamentos, vencimentos e atrasos podem ser registrados por cliente e usados diretamente na análise.
 
-**Motor de limite:** combina capacidade, risco, comportamento e exposição. O histórico não pode criar capacidade financeira inexistente.
+**Motor de limite 4.4:** calcula limite aprovado total, desconta somente a exposição em aberto e apresenta o limite disponível. O limite atual não é subtraído novamente, evitando dupla contagem. O histórico pode moderar o limite, mas não cria capacidade financeira inexistente.
 
 **Auditoria:** alterações e decisões importantes geram registros de data, ação, entidade, valores e motivo.
 
