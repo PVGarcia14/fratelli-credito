@@ -17,7 +17,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.1", page_icon="💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.3", page_icon="💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -329,7 +329,7 @@ def pdf_report(data, path):
     w,h = A4
     y = h-50
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito 4.1")
+    c.drawString(45,y,"Fratelli Crédito 4.3")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -342,7 +342,7 @@ def pdf_report(data, path):
 
 con = db()
 
-st.title("Fratelli Crédito 4.1")
+st.title("Fratelli Crédito 4.3")
 st.caption("Análise empresarial para decisão de crédito — dados ausentes são excluídos do cálculo.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
@@ -472,8 +472,6 @@ if menu == "Nova análise":
         disponivel = disponivel_motor
     else:
         disponivel = max(0, limite - aberto)
-
-    disponivel = max(0, limite - aberto)
     prazo, entrada, decisao = conditions(risco,disponivel,pedido)
     if gate == "BLOQUEADO":
         decisao = "NÃO APROVADO"
@@ -508,7 +506,7 @@ if menu == "Nova análise":
     if faturamento <= 0: justificativas.append("Sem faturamento informado/comprovado, não foi calculado limite por capacidade.")
     if fonte == "Declaração do cliente": justificativas.append("Faturamento declarado recebeu confiança menor que documentação financeira.")
     if tem_restricoes and restricoes > 0: justificativas.append(f"Foram informadas {restricoes} restrição(ões)/protesto(s) confirmado(s).")
-    if tem_historico and atrasos > 0: justificativas.append(f"Há {atrasos} atraso(s); maior atraso informado: {maior_atraso} dia(s).")
+    if tem_historico and atrasos is not None and atrasos > 0: justificativas.append(f"Há {atrasos} atraso(s); maior atraso informado: {maior_atraso if maior_atraso is not None else 'N/D'} dia(s).")
     if quality == "BAIXA":
         justificativas.append("Qualidade de dados baixa: priorizar revisão humana antes de ampliar limite.")
     if not justificativas:
@@ -606,9 +604,9 @@ else:
 **Pesos**
 - Cadastro e estabilidade: 20%
 - Capacidade financeira: 25%
-- Histórico de pagamento: 30%
+- Histórico de pagamento: 20%
 - Exposição: 15%
-- Comportamento operacional: 10%
+- Comportamento operacional: 20%
 
 **Cobertura:** mostra quanto da política total pôde ser efetivamente analisado.
 
