@@ -37,6 +37,30 @@ SEGMENT_FACTORS = {
     "Outro": 0.05,
 }
 
+SERASA_UAT_BASE = "https://uat-api.serasaexperian.com.br/credit-services/business-information-report/v1/reports"
+
+def serasa_uat_test(token, report_name, query_params, timeout=20):
+    """Teste genérico do endpoint UAT informado pelo usuário.
+    Não assume parâmetros proprietários além de reportName.
+    """
+    if not token.strip():
+        return None, "Informe um Bearer Token da Serasa para testar."
+    params = {"reportName": report_name}
+    params.update({k: v for k, v in query_params.items() if str(v).strip()})
+    headers = {
+        "Authorization": token if token.lower().startswith("bearer ") else f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(SERASA_UAT_BASE, params=params, headers=headers, timeout=timeout)
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text
+        return {"status_code": r.status_code, "url": r.url, "payload": payload}, None
+    except requests.RequestException as e:
+        return None, f"Erro de conexão: {e}"
+
 def db():
     con = sqlite3.connect(DB)
     con.execute("""CREATE TABLE IF NOT EXISTS clientes(
@@ -211,7 +235,7 @@ con = db()
 st.title("Fratelli Crédito 4.1")
 st.caption("Análise empresarial para decisão de crédito — dados ausentes são excluídos do cálculo.")
 
-menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico", "Clientes", "Metodologia"])
+menu = st.sidebar.radio("Menu", ["Nova análise", "Teste Serasa UAT", "Histórico", "Clientes", "Metodologia"])
 
 if menu == "Nova análise":
     st.subheader("1. Cadastro e consulta")
@@ -334,6 +358,55 @@ if menu == "Nova análise":
             ],pdf)
             with open(pdf,"rb") as f:
                 st.download_button("Baixar relatório PDF",f,file_name=pdf.name)
+
+elif menu == "Teste Serasa UAT":
+    st.subheader("Teste de integração — Serasa Experian UAT")
+    st.warning("Este módulo é apenas para homologação. Não coloque client_secret ou outras credenciais permanentes no código.")
+
+    st.write("Endpoint base configurado:")
+    st.code(SERASA_UAT_BASE)
+
+    token = st.text_input("Bearer Token", type="password",
+                          help="Cole um token de acesso temporário fornecido pela Serasa. O token não é salvo no banco.")
+    report_name = st.text_input("reportName", value="",
+                                help="Use exatamente o reportName definido na documentação/contrato da Serasa.")
+
+    st.markdown("**Parâmetros adicionais da consulta**")
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        p1_name = st.text_input("Parâmetro 1", value="")
+        p1_value = st.text_input("Valor 1", value="")
+    with q2:
+        p2_name = st.text_input("Parâmetro 2", value="")
+        p2_value = st.text_input("Valor 2", value="")
+    with q3:
+        p3_name = st.text_input("Parâmetro 3", value="")
+        p3_value = st.text_input("Valor 3", value="")
+
+    st.caption("Os nomes dos parâmetros adicionais devem vir da documentação da Serasa. O sistema não inventa o nome do parâmetro do CNPJ.")
+
+    params = {}
+    for n, v in [(p1_name,p1_value),(p2_name,p2_value),(p3_name,p3_value)]:
+        if n.strip() and v.strip():
+            params[n.strip()] = v.strip()
+
+    if st.button("Testar Serasa UAT"):
+        if not report_name.strip():
+            st.error("Informe o reportName.")
+        else:
+            result, err = serasa_uat_test(token, report_name, params)
+            if err:
+                st.error(err)
+            else:
+                st.write(f"HTTP **{result['status_code']}**")
+                if result["status_code"] >= 200 and result["status_code"] < 300:
+                    st.success("Endpoint respondeu com sucesso.")
+                elif result["status_code"] in (401,403):
+                    st.error("A API respondeu, mas a autenticação/credencial não foi aceita.")
+                else:
+                    st.warning("A API respondeu. Veja o corpo abaixo para identificar parâmetros ou permissões necessários.")
+                st.code(str(result["payload"])[:20000], language="json")
+                st.caption(f"URL efetivamente chamada: {result['url']}")
 
 elif menu == "Histórico":
     st.subheader("Histórico de análises")
