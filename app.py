@@ -1,473 +1,480 @@
-import io
-import json
-import os
-import re
-import sqlite3
+import io, json, re, sqlite3
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
-from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
 
-APP_TITLE = "Análise de Crédito Empresarial 6.0"
-DB_PATH = "credito_empresarial_6.db"
-ASSETS = Path("assets")
-TIMEOUT = 15
+APP_TITLE = "Fratelli Crédito 7.0"
+DB_PATH = "fratelli_credito.db"
+LOGO_PATH = Path("assets/fratelli_logo.png")
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="🍾", layout="wide")
 
-# ----------------------------- helpers -----------------------------
-def clean_cnpj(v):
-    return re.sub(r"\D", "", str(v or ""))
+
+# ----------------------------- utilidades -----------------------------
+def clean_cnpj(v): return re.sub(r"\D", "", str(v or ""))
 
 def fmt_cnpj(v):
     n = clean_cnpj(v)
     return f"{n[:2]}.{n[2:5]}.{n[5:8]}/{n[8:12]}-{n[12:]}" if len(n)==14 else str(v or "")
 
 def valid_cnpj(cnpj):
-    n = clean_cnpj(cnpj)
-    if len(n) != 14 or len(set(n)) == 1:
-        return False
-    a = [int(x) for x in n]
-    w1 = [5,4,3,2,9,8,7,6,5,4,3,2]
-    w2 = [6,5,4,3,2,9,8,7,6,5,4,3,2]
-    d1 = sum(x*w for x,w in zip(a[:12],w1)) % 11
-    d1 = 0 if d1 < 2 else 11-d1
-    d2 = sum(x*w for x,w in zip(a[:12]+[d1],w2)) % 11
-    d2 = 0 if d2 < 2 else 11-d2
-    return d1 == a[12] and d2 == a[13]
+    n=clean_cnpj(cnpj)
+    if len(n)!=14 or n==n[0]*14: return False
+    x=list(map(int,n))
+    w1=[5,4,3,2,9,8,7,6,5,4,3,2]
+    w2=[6,5,4,3,2,9,8,7,6,5,4,3,2]
+    d1=sum(a*b for a,b in zip(x[:12],w1))%11
+    d1=0 if d1<2 else 11-d1
+    d2=sum(a*b for a,b in zip(x[:12]+[d1],w2))%11
+    d2=0 if d2<2 else 11-d2
+    return d1==x[12] and d2==x[13]
 
-def money(v):
-    return f"R$ {float(v or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def fmoney(v):
+    return f"R$ {float(v or 0):,.2f}".replace(",","X").replace(".",",").replace("X",".")
 
-def safe_float(v):
-    try: return float(v)
-    except: return 0.0
-
-def parse_date(v):
-    if not v: return None
-    try: return datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+def fdate(v):
+    if not v: return ""
+    try: return datetime.strptime(str(v)[:10],"%Y-%m-%d").date()
     except: return None
 
-def age_years(v):
-    d = parse_date(v)
-    return None if not d else max(0, (date.today()-d).days/365.25)
+def years_active(v):
+    d=fdate(v)
+    return round(max(0,(date.today()-d).days/365.25),1) if d else None
 
-def nonempty(v):
-    return v is not None and str(v).strip() not in ("", "None", "nan", "NaN")
 
-# ----------------------------- database -----------------------------
-def conn():
-    return sqlite3.connect(DB_PATH)
+# ----------------------------- banco -----------------------------
+def db(): return sqlite3.connect(DB_PATH)
 
 def init_db():
-    c = conn()
-    c.execute("""CREATE TABLE IF NOT EXISTS analyses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT, cnpj TEXT, razao TEXT, score REAL, risco TEXT,
-        confianca REAL, cobertura REAL, limite REAL, prazo TEXT, entrada REAL,
-        decisao TEXT, justificativa TEXT, data_json TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS clients (
-        cnpj TEXT PRIMARY KEY, razao TEXT, fantasia TEXT, situacao TEXT,
-        abertura TEXT, ultima_consulta TEXT, data_json TEXT
-    )""")
-    c.commit(); c.close()
+    con=db(); c=con.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS clients(
+      cnpj TEXT PRIMARY KEY, razao TEXT, fantasia TEXT, situacao TEXT,
+      abertura TEXT, porte TEXT, segmento TEXT, capital REAL, raw TEXT,
+      updated_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS analyses(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, cnpj TEXT,
+      razao TEXT, segmento TEXT, score REAL, cobertura REAL, confianca TEXT,
+      status TEXT, risco TEXT, faturamento REAL, faturamento_fonte TEXT,
+      pedido REAL, exposicao REAL, limite REAL, disponivel REAL, condicao TEXT,
+      entrada REAL, decisao TEXT, justificativa TEXT, dados TEXT)""")
+    con.commit(); con.close()
 
 init_db()
 
-def save_client(d):
-    c=conn()
-    c.execute("""INSERT INTO clients VALUES (?,?,?,?,?,?,?)
-                 ON CONFLICT(cnpj) DO UPDATE SET razao=excluded.razao,
-                 fantasia=excluded.fantasia,situacao=excluded.situacao,
-                 abertura=excluded.abertura,ultima_consulta=excluded.ultima_consulta,
-                 data_json=excluded.data_json""",
-              (d.get("cnpj"),d.get("razao"),d.get("fantasia"),d.get("situacao"),
-               d.get("abertura"),datetime.now().isoformat(timespec="seconds"),
-               json.dumps(d,ensure_ascii=False)))
-    c.commit(); c.close()
 
-def save_analysis(d):
-    c=conn()
-    c.execute("""INSERT INTO analyses
-        (created_at,cnpj,razao,score,risco,confianca,cobertura,limite,prazo,entrada,decisao,justificativa,data_json)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (datetime.now().isoformat(timespec="seconds"),d["cnpj"],d.get("razao",""),
-         d["score"],d["risco"],d["confianca"],d["cobertura"],d["limite"],
-         d["prazo"],d["entrada"],d["decisao"],d["justificativa"],
-         json.dumps(d,ensure_ascii=False)))
-    c.commit(); c.close()
-
-# ----------------------------- CNPJ public lookup -----------------------------
-def cnpj_brasilapi(cnpj):
-    r=requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{clean_cnpj(cnpj)}",timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json(), "BrasilAPI"
-
-def cnpj_ws(cnpj):
-    r=requests.get(f"https://publica.cnpj.ws/cnpj/{clean_cnpj(cnpj)}",timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json(), "CNPJ.ws"
-
+# ----------------------------- CNPJ -----------------------------
 def normalize(raw, source):
-    if source=="BrasilAPI":
+    if source=="brasilapi":
         return {
-            "cnpj":clean_cnpj(raw.get("cnpj")),
-            "razao":raw.get("razao_social",""),
-            "fantasia":raw.get("nome_fantasia",""),
-            "situacao":raw.get("descricao_situacao_cadastral") or raw.get("situacao_cadastral"),
-            "abertura":raw.get("data_inicio_atividade"),
-            "porte":raw.get("porte"),
-            "capital":safe_float(raw.get("capital_social")),
-            "cidade":raw.get("municipio",""), "uf":raw.get("uf",""),
-            "cnae":raw.get("cnae_fiscal_descricao",""),
-            "natureza":raw.get("natureza_juridica",""),
-            "source":source, "raw":raw
-        }
+          "cnpj":clean_cnpj(raw.get("cnpj")),
+          "razao":raw.get("razao_social",""), "fantasia":raw.get("nome_fantasia",""),
+          "situacao":raw.get("descricao_situacao_cadastral",""),
+          "abertura":raw.get("data_inicio_atividade",""),
+          "porte":raw.get("porte",""), "capital":float(raw.get("capital_social") or 0),
+          "cidade":raw.get("municipio",""), "uf":raw.get("uf",""),
+          "cnae":raw.get("cnae_fiscal_descricao",""), "fonte":source, "raw":raw}
     est=raw.get("estabelecimento") or {}
+    cap=raw.get("capital_social") or 0
+    try: cap=float(str(cap).replace(".","").replace(",","."))
+    except: cap=0
     return {
-        "cnpj":clean_cnpj(est.get("cnpj") or raw.get("cnpj")),
-        "razao":raw.get("razao_social",""),
-        "fantasia":est.get("nome_fantasia",""),
-        "situacao":est.get("situacao_cadastral"),
-        "abertura":est.get("data_inicio_atividade"),
-        "porte":(raw.get("porte") or {}).get("descricao") if isinstance(raw.get("porte"),dict) else raw.get("porte"),
-        "capital":safe_float(raw.get("capital_social")),
-        "cidade":(est.get("cidade") or {}).get("nome","") if isinstance(est.get("cidade"),dict) else "",
-        "uf":(est.get("estado") or {}).get("sigla","") if isinstance(est.get("estado"),dict) else "",
-        "cnae":((est.get("atividade_principal") or {}).get("descricao","") if isinstance(est.get("atividade_principal"),dict) else ""),
-        "natureza":((raw.get("natureza_juridica") or {}).get("descricao","") if isinstance(raw.get("natureza_juridica"),dict) else ""),
-        "source":source, "raw":raw
-    }
+      "cnpj":clean_cnpj(est.get("cnpj") or raw.get("cnpj")),
+      "razao":raw.get("razao_social",""), "fantasia":est.get("nome_fantasia",""),
+      "situacao":est.get("situacao_cadastral",""),
+      "abertura":est.get("data_inicio_atividade",""),
+      "porte":(raw.get("porte") or {}).get("descricao","") if isinstance(raw.get("porte"),dict) else str(raw.get("porte","")),
+      "capital":cap,
+      "cidade":(est.get("cidade") or {}).get("nome","") if isinstance(est.get("cidade"),dict) else "",
+      "uf":(est.get("estado") or {}).get("sigla","") if isinstance(est.get("estado"),dict) else "",
+      "cnae":(est.get("atividade_principal") or {}).get("descricao","") if isinstance(est.get("atividade_principal"),dict) else "",
+      "fonte":source, "raw":raw}
 
-def consult_cnpj(cnpj):
-    errors=[]
-    for fn in (cnpj_brasilapi, cnpj_ws):
+def query_cnpj(cnpj):
+    n=clean_cnpj(cnpj); errors=[]
+    for name,url in [
+      ("BrasilAPI",f"https://brasilapi.com.br/api/cnpj/v1/{n}"),
+      ("CNPJ.ws",f"https://publica.cnpj.ws/cnpj/{n}")]:
         try:
-            raw,src=fn(cnpj); return normalize(raw,src), errors
-        except Exception as e:
-            errors.append(f"{fn.__name__}: {e}")
-    raise RuntimeError("Nenhuma fonte pública de CNPJ respondeu. " + " | ".join(errors))
+            r=requests.get(url,headers={"User-Agent":"FratelliCredito/7.0"},timeout=10)
+            if r.status_code==200:
+                return normalize(r.json(),"brasilapi" if name=="BrasilAPI" else "cnpjws"),errors
+            errors.append(f"{name}: HTTP {r.status_code}")
+        except Exception as e: errors.append(f"{name}: {type(e).__name__}")
+    return None,errors
 
-# ----------------------------- scoring -----------------------------
-# PRINCIPLE: missing data is excluded from both numerator and denominator.
-# It never earns points and never loses points.
+
+# ----------------------------- motor 7.0 -----------------------------
+# Critérios e pesos. Ausência de dado = N/D e NÃO entra no denominador.
 WEIGHTS = {
-    "situação cadastral": 20,
-    "idade da empresa": 10,
-    "negativações/bureau": 25,
-    "capacidade financeira": 20,
-    "comportamento de pagamento": 15,
-    "exposição atual": 10,
+    "cadastro_estabilidade":20,
+    "capacidade_financeira":25,
+    "historico_pagamento":30,
+    "exposicao":15,
+    "comportamento_operacional":10
 }
 
-def criterion(name, score, available, detail, weight):
-    return {"name":name,"score":score,"available":available,"detail":detail,"weight":weight}
+SEGMENT_FACTOR={"Bar":0.06,"Restaurante":0.07,"Distribuidor":0.10,
+                "Supermercado":0.08,"Empório":0.07,"Hotel":0.07,"Outro":0.05}
 
-def score_analysis(d):
-    criteria=[]
-    sit=(d.get("situacao") or "").upper()
-    if sit:
-        s=100 if "ATIVA" in sit else 0
-        criteria.append(criterion("situação cadastral",s,True,sit,WEIGHTS["situação cadastral"]))
-    else:
-        criteria.append(criterion("situação cadastral",None,False,"Não informado",WEIGHTS["situação cadastral"]))
+def score_activity(anos):
+    if anos is None: return None
+    if anos>=10:return 100
+    if anos>=5:return 90
+    if anos>=3:return 80
+    if anos>=2:return 70
+    if anos>=1:return 55
+    return 40
 
-    age=age_years(d.get("abertura"))
-    if age is not None:
-        s=min(100,age/10*100)
-        criteria.append(criterion("idade da empresa",s,True,f"{age:.1f} anos",WEIGHTS["idade da empresa"]))
-    else:
-        criteria.append(criterion("idade da empresa",None,False,"Não informado",WEIGHTS["idade da empresa"]))
+def score_capacity(fat,pedido,expo):
+    if fat<=0:return None
+    ratio=(pedido+expo)/fat
+    if ratio<=.02:return 100
+    if ratio<=.05:return 90
+    if ratio<=.10:return 75
+    if ratio<=.20:return 55
+    if ratio<=.35:return 35
+    return 10
 
-    neg=d.get("negativacoes")
-    protest=d.get("protestos")
-    if neg is not None or protest is not None:
-        n=max(0,safe_float(neg)); p=max(0,safe_float(protest))
-        s=max(0,100 - min(100,n*20+p*15))
-        criteria.append(criterion("negativações/bureau",s,True,f"Negativações: {int(n)} | Protestos: {int(p)}",WEIGHTS["negativações/bureau"]))
-    else:
-        criteria.append(criterion("negativações/bureau",None,False,"Não consultado/informado",WEIGHTS["negativações/bureau"]))
+def score_payments(total,ontime,avg_delay,max_delay):
+    if total<=0:return None
+    pct=max(0,min(1,ontime/total))
+    s=pct*100
+    s-=min(30,avg_delay*1.5)
+    if max_delay>60:s-=35
+    elif max_delay>30:s-=20
+    elif max_delay>15:s-=10
+    return max(0,min(100,s))
 
-    fat=d.get("faturamento")
-    pedido=d.get("pedido")
-    if fat is not None and safe_float(fat)>0:
-        ratio=safe_float(pedido)/safe_float(fat) if safe_float(fat)>0 else 1
-        s=max(0,min(100,(1-ratio)*100))
-        criteria.append(criterion("capacidade financeira",s,True,f"Pedido = {ratio*100:.1f}% do faturamento mensal",WEIGHTS["capacidade financeira"]))
-    else:
-        criteria.append(criterion("capacidade financeira",None,False,"Faturamento não informado por fonte confiável",WEIGHTS["capacidade financeira"]))
+def score_exposure(fat,expo):
+    if fat<=0:return None
+    r=expo/fat
+    if r<=.02:return 100
+    if r<=.05:return 90
+    if r<=.10:return 75
+    if r<=.20:return 55
+    if r<=.35:return 35
+    return 10
 
-    total=d.get("pagamentos_total")
-    dia=d.get("pagamentos_dia")
-    atraso=d.get("atraso_medio")
-    if total is not None and safe_float(total)>0 and dia is not None:
-        ontime=max(0,min(100,safe_float(dia)/safe_float(total)*100))
-        penalty=min(50,max(0,safe_float(atraso or 0)))
-        s=max(0,ontime-penalty)
-        criteria.append(criterion("comportamento de pagamento",s,True,f"{ontime:.1f}% em dia | atraso médio {safe_float(atraso):.1f} dias",WEIGHTS["comportamento de pagamento"]))
-    else:
-        criteria.append(criterion("comportamento de pagamento",None,False,"Histórico interno não informado",WEIGHTS["comportamento de pagamento"]))
+def score_operations(occ,atrasos,maior):
+    if occ==0 and atrasos==0 and maior==0:
+        return None
+    s=100
+    s-=min(50,occ*15)
+    if maior>60:s-=35
+    elif maior>30:s-=20
+    elif maior>15:s-=10
+    return max(0,min(100,s))
 
-    exp=d.get("exposicao")
-    if exp is not None and fat is not None and safe_float(fat)>0:
-        ratio=safe_float(exp)/safe_float(fat)
-        s=max(0,min(100,(1-ratio)*100))
-        criteria.append(criterion("exposição atual",s,True,f"Exposição = {ratio*100:.1f}% do faturamento mensal",WEIGHTS["exposição atual"]))
-    else:
-        criteria.append(criterion("exposição atual",None,False,"Exposição ou faturamento não informado",WEIGHTS["exposição atual"]))
+def score_cadastro(company):
+    situ=str(company.get("situacao","")).upper()
+    anos=years_active(company.get("abertura"))
+    vals=[]
+    if situ:
+        vals.append(100 if any(x in situ for x in ["ATIVA","REGULAR"]) else 20)
+    a=score_activity(anos)
+    if a is not None: vals.append(a)
+    return sum(vals)/len(vals) if vals else None
 
-    avail=[c for c in criteria if c["available"]]
-    weight_total=sum(c["weight"] for c in avail)
-    score=sum(c["score"]*c["weight"] for c in avail)/weight_total if weight_total else None
-    coverage=weight_total/sum(WEIGHTS.values())*100
-    confidence=coverage
-
-    # Hard-stop rules based only on known negative facts.
-    hard_stop = (sit and "ATIVA" not in sit) or (neg is not None and safe_float(neg)>0 and protest is not None and safe_float(protest)>0)
-    if hard_stop:
-        risk="ALTO"
-    elif score is None or coverage < 45:
-        risk="DADOS INSUFICIENTES"
-    elif score>=80:
-        risk="BAIXO"
-    elif score>=60:
-        risk="MÉDIO"
-    else:
-        risk="ALTO"
-
-    # Credit terms only when enough evidence exists.
-    if risk=="DADOS INSUFICIENTES":
-        limit=0; entry=max(0,safe_float(pedido)); term="À vista"
-        decision="ANÁLISE INCONCLUSIVA — solicitar dados"
-    else:
-        fatv=safe_float(fat or 0)
-        expv=safe_float(exp or 0)
-        if risk=="BAIXO":
-            limit=min(max(fatv*0.25,3000),30000) if fatv else 0
-            term="30/60" if safe_float(pedido)<=limit*1.5 and limit>0 else "À vista + 30"
-            decision="APROVAR" if safe_float(pedido)<=max(limit-expv,0) else "APROVAR COM CONDIÇÃO"
-        elif risk=="MÉDIO":
-            limit=min(max(fatv*0.15,1500),12000) if fatv else 0
-            term="À vista + 30" if limit else "À vista"
-            decision="APROVAR COM CONDIÇÃO" if safe_float(pedido)<=max(limit-expv,0) else "REDUZIR LIMITE / ENTRADA"
-        else:
-            limit=0; term="À vista"; decision="À vista"
-        entry=max(0,safe_float(pedido)-max(0,limit-expv))
-
-    used=[f'{c["name"]}: {c["score"]:.1f}/100' for c in avail]
-    missing=[c["name"] for c in criteria if not c["available"]]
-    justification="Critérios considerados: " + (", ".join(used) if used else "nenhum")
-    if missing: justification += ". Dados ausentes foram DESCONSIDERADOS: " + ", ".join(missing) + "."
-    if hard_stop: justification += " Há informação cadastral/negativa suficiente para bloqueio de crédito."
-    if risk=="DADOS INSUFICIENTES": justification += " A cobertura de dados está abaixo do mínimo para uma decisão de crédito confiável."
-
-    return {
-        "score": round(score,1) if score is not None else None,
-        "risco":risk,"confianca":round(confidence,1),"cobertura":round(coverage,1),
-        "limite":round(limit,2),"entrada":round(entry,2),"prazo":term,
-        "decisao":decision,"justificativa":justification,"criteria":criteria
+def analyze(d):
+    scores={
+      "cadastro_estabilidade":score_cadastro(d["company"]),
+      "capacidade_financeira":score_capacity(d["faturamento"],d["pedido"],d["exposicao"]),
+      "historico_pagamento":score_payments(d["total_pagamentos"],d["pagamentos_dia"],d["atraso_medio"],d["maior_atraso"]),
+      "exposicao":score_exposure(d["faturamento"],d["exposicao"]),
+      "comportamento_operacional":score_operations(d["ocorrencias"],d["titulos_atrasados"],d["maior_atraso"])
     }
+    weighted=0; used=0
+    for k,w in WEIGHTS.items():
+        if scores[k] is not None:
+            weighted += scores[k]*w; used += w
+    coverage=used/sum(WEIGHTS.values())*100
+    normalized=weighted/used if used else None
+
+    # Segurança: sem dados suficientes não classifica como bom/ruim.
+    if coverage < 50:
+        status="DADOS INSUFICIENTES"; risco="NÃO CLASSIFICADO"; score=None
+    else:
+        score=round(normalized,1)
+        hard=[]
+        situ=str(d["company"].get("situacao","")).upper()
+        if situ and not any(x in situ for x in ["ATIVA","REGULAR"]): hard.append("situação cadastral não ativa/regular")
+        if d["maior_atraso"]>90: hard.append("maior atraso superior a 90 dias")
+        if hard:
+            risco="ELEVADO"
+        elif score>=80: risco="CONTROLADO"
+        elif score>=60: risco="MODERADO"
+        else: risco="ELEVADO"
+        status="ANÁLISE CONCLUÍDA"
+
+    # Limite: sem capacidade financeira comprovada, não usar faturamento estimado.
+    if d["faturamento"]>0 and score is not None:
+        factor=SEGMENT_FACTOR[d["segmento"]]
+        base=d["faturamento"]*factor
+        if risco=="CONTROLADO": limite=min(30000,max(3000,base))
+        elif risco=="MODERADO": limite=min(12000,max(1500,base*.6))
+        else: limite=0
+    elif d["compras_12m"]>0 and d["total_pagamentos"]>0 and score is not None and risco=="CONTROLADO":
+        limite=min(5000,max(1000,d["compras_12m"]*.05))
+    else:
+        limite=0
+    disponivel=max(0,limite-d["exposicao"])
+
+    if status!="ANÁLISE CONCLUÍDA":
+        condicao="PENDENTE DE INFORMAÇÕES"
+        decisao="NÃO CONCEDER CRÉDITO AUTOMÁTICO"
+        entrada=d["pedido"]
+    elif risco=="CONTROLADO" and d["pedido"]<=disponivel:
+        condicao="30/60" if d["pedido"]<=disponivel*.5 else "À vista + 30"
+        decisao="APROVAR"
+        entrada=0
+    elif risco=="MODERADO" and disponivel>0:
+        condicao="Entrada + 30"; decisao="APROVAR COM ENTRADA"; entrada=max(0,d["pedido"]-disponivel)
+    elif risco=="ELEVADO":
+        condicao="À vista"; decisao="VENDA À VISTA"; entrada=d["pedido"]
+    else:
+        condicao="Entrada + 30" if disponivel>0 else "À vista"
+        decisao="APROVAR COM ENTRADA" if disponivel>0 else "VENDA À VISTA"
+        entrada=max(0,d["pedido"]-disponivel) if disponivel>0 else d["pedido"]
+
+    missing=[]
+    if d["faturamento"]<=0: missing.append("faturamento")
+    if d["total_pagamentos"]<=0: missing.append("histórico de pagamentos")
+    if d["compras_12m"]<=0: missing.append("histórico comercial")
+    if not d["company"].get("situacao"): missing.append("situação cadastral")
+    if not d["exposicao"] and d["faturamento"]<=0: pass
+
+    reasons=[]
+    if d["company"].get("situacao"): reasons.append(f"situação cadastral: {d['company']['situacao']}")
+    if years_active(d["company"].get("abertura")) is not None: reasons.append(f"{years_active(d['company'].get('abertura'))} anos de atividade")
+    if d["faturamento"]>0: reasons.append(f"pedido + exposição representam {(d['pedido']+d['exposicao'])/d['faturamento']*100:.1f}% do faturamento informado")
+    if d["total_pagamentos"]>0: reasons.append(f"{d['pagamentos_dia']/d['total_pagamentos']*100:.1f}% dos pagamentos registrados em dia")
+    if d["maior_atraso"]>0: reasons.append(f"maior atraso informado: {d['maior_atraso']:.0f} dias")
+    if d["ocorrencias"]>0: reasons.append(f"{d['ocorrencias']} ocorrência(s) operacional(is)")
+    if missing: reasons.append("informações ausentes: "+", ".join(missing))
+    if status=="DADOS INSUFICIENTES":
+        reasons.append("os critérios ausentes foram excluídos do cálculo; o sistema não os tratou como positivos nem negativos")
+    justification="; ".join(reasons)+"."
+
+    return {**d,"scores":scores,"score":score,"coverage":round(coverage,1),
+            "risco":risco,"status":status,"limite":limite,"disponivel":disponivel,
+            "condicao":condicao,"entrada":entrada,"decisao":decisao,
+            "justificativa":justification}
+
+
+# ----------------------------- persistência -----------------------------
+def save_analysis(r):
+    con=db()
+    con.execute("""INSERT INTO analyses(created_at,cnpj,razao,segmento,score,cobertura,confianca,status,risco,
+      faturamento,faturamento_fonte,pedido,exposicao,limite,disponivel,condicao,entrada,decisao,justificativa,dados)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(
+      datetime.now().isoformat(timespec="seconds"),r["company"]["cnpj"],r["company"]["razao"],r["segmento"],
+      r["score"],r["coverage"],("ALTA" if r["coverage"]>=80 else "MÉDIA" if r["coverage"]>=50 else "BAIXA"),
+      r["status"],r["risco"],r["faturamento"],r["faturamento_fonte"],r["pedido"],r["exposicao"],r["limite"],
+      r["disponivel"],r["condicao"],r["entrada"],r["decisao"],r["justificativa"],json.dumps(r,default=str,ensure_ascii=False)))
+    con.commit(); con.close()
+
+def save_client(c,segmento):
+    con=db()
+    con.execute("""INSERT INTO clients(cnpj,razao,fantasia,situacao,abertura,porte,segmento,capital,raw,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cnpj) DO UPDATE SET razao=excluded.razao,fantasia=excluded.fantasia,
+      situacao=excluded.situacao,abertura=excluded.abertura,porte=excluded.porte,segmento=excluded.segmento,
+      capital=excluded.capital,raw=excluded.raw,updated_at=excluded.updated_at""",(
+      c["cnpj"],c["razao"],c["fantasia"],c["situacao"],c["abertura"],c["porte"],segmento,c["capital"],
+      json.dumps(c["raw"],ensure_ascii=False),datetime.now().isoformat(timespec="seconds")))
+    con.commit();con.close()
+
 
 # ----------------------------- PDF -----------------------------
-def pdf_report(data):
-    buf=io.BytesIO()
-    doc=SimpleDocTemplate(buf,pagesize=A4,rightMargin=36,leftMargin=36,topMargin=36,bottomMargin=36)
-    styles=getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="CenterTitle", parent=styles["Title"], alignment=TA_CENTER, fontSize=16))
-    story=[Paragraph("ANÁLISE DE CRÉDITO EMPRESARIAL",styles["CenterTitle"]),Spacer(1,12)]
-    rows=[
-        ["CNPJ",fmt_cnpj(data["cnpj"])],
-        ["Razão social",data.get("razao","")],
-        ["Score",str(data.get("score") if data.get("score") is not None else "N/D")],
-        ["Risco",data["risco"]],
-        ["Cobertura dos dados",f'{data["cobertura"]:.1f}%'],
-        ["Confiança",f'{data["confianca"]:.1f}%'],
-        ["Limite sugerido",money(data["limite"])],
-        ["Condição",data["prazo"]],
-        ["Entrada",money(data["entrada"])],
-        ["Decisão",data["decisao"]],
+def make_pdf(r):
+    b=io.BytesIO(); c=canvas.Canvas(b,pagesize=A4); w,h=A4
+    x=18*mm;y=h-20*mm
+    c.setFont("Helvetica-Bold",18);c.drawString(x,y,"FRATELLI CRÉDITO 7.0");y-=9*mm
+    c.setFont("Helvetica-Bold",12);c.drawString(x,y,"Relatório de análise empresarial");y-=8*mm
+    lines=[
+      f"CNPJ: {fmt_cnpj(r['company']['cnpj'])}",
+      f"Empresa: {r['company']['razao']}",
+      f"Situação: {r['company']['situacao']}",
+      f"Status: {r['status']}",
+      f"Score: {'N/D' if r['score'] is None else str(r['score'])+'/100'}",
+      f"Cobertura dos dados: {r['coverage']:.0f}%",
+      f"Risco: {r['risco']}",
+      f"Faturamento: {fmoney(r['faturamento']) if r['faturamento']>0 else 'Não informado'}",
+      f"Limite: {fmoney(r['limite'])}",
+      f"Disponível: {fmoney(r['disponivel'])}",
+      f"Pedido: {fmoney(r['pedido'])}",
+      f"Condição: {r['condicao']}",
+      f"Entrada: {fmoney(r['entrada'])}",
+      f"Decisão: {r['decisao']}"
     ]
-    t=Table(rows,colWidths=[150,330])
-    t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.4,colors.grey),("BACKGROUND",(0,0),(0,-1),colors.whitesmoke),("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story += [t,Spacer(1,14),Paragraph("Justificativa",styles["Heading2"]),Paragraph(data["justificativa"],styles["BodyText"]),Spacer(1,12),Paragraph("Critérios",styles["Heading2"])]
-    crows=[["Critério","Status","Nota","Peso","Detalhe"]]
-    for c in data["criteria"]:
-        crows.append([c["name"],"Considerado" if c["available"] else "Desconsiderado",f'{c["score"]:.1f}' if c["score"] is not None else "N/D",str(c["weight"]),c["detail"]])
-    ct=Table(crows,colWidths=[105,80,45,45,205],repeatRows=1)
-    ct.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.35,colors.grey),("BACKGROUND",(0,0),(-1,0),colors.HexColor("#222222")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTSIZE",(0,0),(-1,-1),7)]))
-    story.append(ct)
-    story.append(Spacer(1,10))
-    story.append(Paragraph("Este relatório é uma ferramenta de apoio à decisão. Informações de bureaus dependem de contrato, autorização e disponibilidade da fonte.",styles["Italic"]))
-    doc.build(story)
-    return buf.getvalue()
+    c.setFont("Helvetica",9)
+    for line in lines:
+        c.drawString(x,y,line[:110]);y-=5.5*mm
+    y-=3*mm;c.setFont("Helvetica-Bold",10);c.drawString(x,y,"Justificativa");y-=5*mm
+    c.setFont("Helvetica",8.5)
+    words=r["justificativa"].split();line=""
+    for word in words:
+        if len(line+" "+word)>105:
+            c.drawString(x,y,line);y-=4.5*mm;line=word
+        else: line=(line+" "+word).strip()
+    if line:c.drawString(x,y,line)
+    c.save();return b.getvalue()
 
-# ----------------------------- UI -----------------------------
-st.title(APP_TITLE)
-st.caption("Regra central da versão 6.0: dado ausente não é bom nem ruim — fica fora do cálculo.")
 
-menu=st.sidebar.radio("Menu",["Nova análise","Histórico","Integrações","Política","Sobre"])
+# ----------------------------- interface -----------------------------
+def brand():
+    if LOGO_PATH.exists(): st.image(str(LOGO_PATH),width=190)
+    else: st.markdown("## 🍾 FRATELLI")
+    st.caption("Análise de crédito empresarial 7.0")
 
-if menu=="Nova análise":
-    st.subheader("1. Identificação")
-    c1,c2=st.columns([4,1])
-    with c1:
-        cnpj=st.text_input("CNPJ",placeholder="00.000.000/0000-00")
-    with c2:
-        consultar=st.button("CONSULTAR CNPJ",use_container_width=True)
-    if consultar:
-        if not valid_cnpj(cnpj):
-            st.error("CNPJ inválido. Confira os 14 dígitos.")
+def new_analysis():
+    st.title("Nova análise")
+    cnpj=st.text_input("CNPJ",placeholder="00.000.000/0000-00")
+    if st.button("🔎 Consultar CNPJ",type="primary"):
+        if not valid_cnpj(cnpj): st.error("CNPJ inválido.");return
+        with st.spinner("Consultando dados cadastrais..."):
+            c,errs=query_cnpj(cnpj)
+        if c:
+            st.session_state["company"]=c
+            save_client(c,"Outro")
+            st.success(f"Empresa encontrada pela fonte {c['fonte']}.")
         else:
-            try:
-                d,errs=consult_cnpj(cnpj)
-                st.session_state["empresa"]=d
-                save_client(d)
-                st.success(f"Empresa localizada via {d['source']}.")
-            except Exception as e:
-                st.error(str(e))
+            st.error("Não foi possível localizar o CNPJ.")
+            for e in errs: st.caption(e)
+            return
+    c=st.session_state.get("company")
+    if not c:
+        st.info("Informe um CNPJ para iniciar.");return
 
-    emp=st.session_state.get("empresa",{})
-    if emp:
-        st.subheader("2. Dados cadastrais")
-        a,b,c=st.columns(3)
-        a.metric("Razão social",emp.get("razao") or "Não informado")
-        b.metric("Situação",emp.get("situacao") or "Não informado")
-        c.metric("Abertura",emp.get("abertura") or "Não informado")
-        st.write(f"**Fantasia:** {emp.get('fantasia') or 'Não informado'}")
-        st.write(f"**Porte:** {emp.get('porte') or 'Não informado'}  |  **Capital social:** {money(emp.get('capital',0)) if emp.get('capital') else 'Não informado'}")
-        st.write(f"**Município/UF:** {emp.get('cidade') or 'Não informado'} / {emp.get('uf') or 'N/D'}")
-        st.caption(f"Fonte cadastral: {emp.get('source')}")
+    st.subheader("Dados encontrados automaticamente")
+    a,b,d=st.columns(3)
+    a.metric("Razão social",c["razao"] or "Não informado")
+    b.metric("Nome fantasia",c["fantasia"] or "Não informado")
+    d.metric("Situação",c["situacao"] or "Não informado")
+    a,b,d=st.columns(3)
+    a.metric("Abertura",c["abertura"] or "Não informado")
+    b.metric("Porte",c["porte"] or "Não informado")
+    d.metric("Capital social",fmoney(c["capital"]))
+    st.caption(f"CNAE: {c['cnae'] or 'Não informado'} | Local: {c['cidade'] or '—'} / {c['uf'] or '—'}")
 
-    st.subheader("3. Dados financeiros e comportamentais")
-    st.info("Preencha somente dados comprovados. Se deixar vazio, o critério será desconsiderado e não alterará o score.")
-    r1,r2,r3=st.columns(3)
-    fat=r1.number_input("Faturamento mensal comprovado (R$)",min_value=0.0,step=1000.0)
-    pedido=r2.number_input("Valor do pedido (R$)",min_value=0.0,step=100.0)
-    exposicao=r3.number_input("Exposição atual (R$)",min_value=0.0,step=100.0)
-    r4,r5,r6=st.columns(3)
-    pagamentos_total=r4.number_input("Total de pagamentos registrados",min_value=0,step=1)
-    pagamentos_dia=r5.number_input("Pagamentos em dia",min_value=0,step=1)
-    atraso_medio=r6.number_input("Atraso médio (dias)",min_value=0.0,step=1.0)
+    st.subheader("Dados para análise")
+    st.info("Regra 7.0: informação ausente é N/D. Ela não recebe pontos positivos nem negativos e é retirada do denominador do score.")
+    seg=st.selectbox("Segmento",list(SEGMENT_FACTOR))
+    a,b,d=st.columns(3)
+    fat=a.number_input("Faturamento mensal comprovado/informado (R$)",min_value=0.0,step=1000.0)
+    pedido=b.number_input("Valor do pedido (R$)",min_value=0.0,step=500.0)
+    expo=d.number_input("Exposição atual (R$)",min_value=0.0,step=500.0)
+    fonte=st.selectbox("Fonte do faturamento",["Não informado","Documento financeiro","Declaração do cliente","Fonte financeira autorizada","Histórico interno"])
+    a,b,d=st.columns(3)
+    compras=a.number_input("Compras nos últimos 12 meses (R$)",min_value=0.0,step=1000.0)
+    total=b.number_input("Pagamentos registrados",min_value=0,step=1)
+    dia=d.number_input("Pagamentos em dia",min_value=0,step=1)
+    a,b,d,e=st.columns(4)
+    tit=a.number_input("Títulos atrasados",min_value=0,step=1)
+    atraso=a.number_input("Valor em atraso (R$)",min_value=0.0,step=500.0)
+    medio=b.number_input("Atraso médio (dias)",min_value=0.0,step=1.0)
+    maior=e.number_input("Maior atraso (dias)",min_value=0.0,step=1.0)
+    a,b=st.columns(2)
+    ocorr=a.number_input("Ocorrências/devoluções",min_value=0,step=1)
+    restr=b.number_input("Restrições confirmadas",min_value=0,step=1)
 
-    st.subheader("4. Bureau / restrições")
-    st.caption("A integração automática com bureau exige contrato/API e credenciais. Sem isso, o sistema não inventa dados.")
-    b1,b2,b3=st.columns(3)
-    neg=b1.number_input("Negativações",min_value=0,step=1)
-    prot=b2.number_input("Protestos",min_value=0,step=1)
-    ext_score=b3.number_input("Score externo (opcional)",min_value=0.0,max_value=1000.0,step=1.0)
-    bureau_source=st.text_input("Fonte do bureau (ex.: Serasa / outro)",placeholder="Deixe vazio se não houver consulta")
+    if st.button("⚡ Executar análise 7.0",type="primary",use_container_width=True):
+        r=analyze({"company":c,"segmento":seg,"faturamento":fat,"faturamento_fonte":fonte,
+                   "pedido":pedido,"exposicao":expo,"compras_12m":compras,"total_pagamentos":total,
+                   "pagamentos_dia":min(dia,total),"titulos_atrasados":tit,"valor_atraso":atraso,
+                   "atraso_medio":medio,"maior_atraso":maior,"ocorrencias":ocorr,"restricoes":restr})
+        st.session_state["result"]=r;save_analysis(r)
 
-    # Treat zeros as missing for bureau fields because zero is not distinguishable from 'not queried' in this simple UI.
-    # Explicit checkbox allows zero to be confirmed.
-    z1,z2=st.columns(2)
-    neg_confirm=z1.checkbox("Confirmo que negativações = 0",value=False)
-    prot_confirm=z2.checkbox("Confirmo que protestos = 0",value=False)
-    neg_val=neg if neg_confirm or neg>0 else None
-    prot_val=prot if prot_confirm or prot>0 else None
+    r=st.session_state.get("result")
+    if not r:return
+    st.subheader("Resultado")
+    a,b,d,e=st.columns(4)
+    a.metric("Score", "N/D" if r["score"] is None else f"{r['score']:.1f}/100")
+    b.metric("Cobertura",f"{r['coverage']:.0f}%")
+    d.metric("Status",r["status"])
+    e.metric("Risco",r["risco"])
+    if r["status"]=="DADOS INSUFICIENTES":
+        st.warning("⚪ DADOS INSUFICIENTES — o sistema não classificou a empresa como boa ou ruim.")
+    elif r["risco"]=="CONTROLADO": st.success("🟢 RISCO CONTROLADO")
+    elif r["risco"]=="MODERADO": st.warning("🟡 RISCO MODERADO")
+    else: st.error("🔴 RISCO ELEVADO")
 
-    if st.button("CALCULAR ANÁLISE",type="primary",use_container_width=True):
-        if not emp:
-            st.warning("Consulte primeiro o CNPJ.")
-        else:
-            data={**emp,
-                  "faturamento":fat if fat>0 else None,
-                  "pedido":pedido if pedido>0 else None,
-                  "exposicao":exposicao if exposicao>0 else None,
-                  "pagamentos_total":pagamentos_total if pagamentos_total>0 else None,
-                  "pagamentos_dia":pagamentos_dia if pagamentos_total>0 else None,
-                  "atraso_medio":atraso_medio if pagamentos_total>0 else None,
-                  "negativacoes":neg_val,"protestos":prot_val,
-                  "bureau_source":bureau_source or None,
-                  "score_externo":ext_score if ext_score>0 else None}
-            result=score_analysis(data)
-            data.update(result)
-            data["cnpj"]=emp["cnpj"]
-            save_analysis(data)
-            st.session_state["resultado"]=data
+    a,b,d=st.columns(3)
+    a.metric("Limite recomendado",fmoney(r["limite"]))
+    b.metric("Crédito disponível",fmoney(r["disponivel"]))
+    d.metric("Entrada",fmoney(r["entrada"]))
+    st.info(f"**Condição:** {r['condicao']}  |  **Decisão:** {r['decisao']}")
+    st.markdown("### Justificativa")
+    st.write(r["justificativa"])
 
-    result=st.session_state.get("resultado")
-    if result:
-        st.divider()
-        st.subheader("5. Resultado")
-        k1,k2,k3,k4,k5=st.columns(5)
-        k1.metric("Score", "N/D" if result["score"] is None else f'{result["score"]:.1f}/100')
-        k2.metric("Risco",result["risco"])
-        k3.metric("Cobertura",f'{result["cobertura"]:.1f}%')
-        k4.metric("Limite",money(result["limite"]))
-        k5.metric("Condição",result["prazo"])
-        st.write(f"**Entrada:** {money(result['entrada'])}")
-        st.write(f"**Decisão:** {result['decisao']}")
-        if result["risco"]=="DADOS INSUFICIENTES":
-            st.warning(result["justificativa"])
-        elif result["risco"]=="ALTO":
-            st.error(result["justificativa"])
-        else:
-            st.info(result["justificativa"])
+    labels={"cadastro_estabilidade":"Cadastro e estabilidade","capacidade_financeira":"Capacidade financeira",
+            "historico_pagamento":"Histórico de pagamento","exposicao":"Exposição",
+            "comportamento_operacional":"Comportamento operacional"}
+    comp=[]
+    for k,v in r["scores"].items():
+        comp.append({"Critério":labels[k],"Peso":WEIGHTS[k],"Resultado":"N/D" if v is None else round(v,1),
+                     "Participou do score": "Não" if v is None else "Sim"})
+    st.markdown("### Auditoria do score")
+    st.dataframe(pd.DataFrame(comp),use_container_width=True,hide_index=True)
 
-        st.subheader("Composição do score")
-        rows=[]
-        for c in result["criteria"]:
-            rows.append({"Critério":c["name"],"Situação":"Considerado" if c["available"] else "DESCONSIDERADO","Nota":c["score"] if c["score"] is not None else None,"Peso":c["weight"],"Detalhe":c["detail"]})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+    st.caption("Cobertura é a parcela dos pesos para a qual havia dados suficientes. Ela não é uma probabilidade de inadimplência.")
+    st.download_button("📄 Baixar relatório PDF",make_pdf(r),f"analise_{clean_cnpj(c['cnpj'])}.pdf","application/pdf",use_container_width=True)
 
-        pdf=pdf_report(result)
-        st.download_button("Baixar relatório PDF",pdf,f"analise_{clean_cnpj(result['cnpj'])}.pdf","application/pdf")
+def history():
+    st.title("Histórico")
+    con=db();df=pd.read_sql_query("SELECT created_at,cnpj,razao,score,cobertura,status,risco,limite,condicao,decisao FROM analyses ORDER BY id DESC",con);con.close()
+    if df.empty:st.info("Sem análises.");return
+    df["cnpj"]=df["cnpj"].apply(fmt_cnpj)
+    st.dataframe(df,use_container_width=True,hide_index=True)
+    st.download_button("Exportar CSV",df.to_csv(index=False).encode("utf-8-sig"),"historico.csv","text/csv")
 
-elif menu=="Histórico":
-    st.subheader("Histórico de análises")
-    df=pd.read_sql_query("SELECT created_at,cnpj,razao,score,risco,confianca,cobertura,limite,prazo,decisao FROM analyses ORDER BY id DESC",conn())
-    if df.empty: st.info("Nenhuma análise registrada.")
-    else:
-        st.dataframe(df,use_container_width=True,hide_index=True)
-        st.download_button("Exportar CSV",df.to_csv(index=False).encode("utf-8-sig"),"historico_credito.csv","text/csv")
-
-elif menu=="Integrações":
-    st.subheader("Integrações")
-    st.markdown("### CNPJ público")
-    st.success("BrasilAPI + CNPJ.ws configurados como fontes cadastrais.")
-    st.markdown("### Bureau de crédito")
-    st.warning("Serasa/SPC e outros bureaus não são consultados por scraping ou credenciais inventadas. A integração automática exige contrato/API autorizado.")
-    st.markdown("A Serasa Experian disponibiliza APIs para relatórios PJ; os produtos podem retornar, conforme contratação, negativações, protestos, cheques, score e outros dados. Configure a integração conforme o produto e as credenciais do seu contrato.")
-    st.code("""# Exemplo de configuração futura
-SERASA_CLIENT_ID=...
-SERASA_CLIENT_SECRET=...
-SERASA_TOKEN_URL=...
-SERASA_API_BASE=...
-SERASA_REPORT=...
-""",language="bash")
-    st.caption("Quando você tiver as credenciais e o layout do produto contratado, o adaptador pode ser conectado sem alterar o motor de score.")
-
-elif menu=="Política":
-    st.subheader("Política de decisão 6.0")
+def policy():
+    st.title("Metodologia 7.0")
     st.markdown("""
-**1. Dados faltantes não recebem nota.** O peso do critério é retirado do denominador.
+### Princípio central
+**Ausência de informação não é evidência positiva nem negativa.**
 
-**2. Score não é confiança.** A tela mostra separadamente score e cobertura/confiança.
+Quando um critério não tem dados confiáveis, ele recebe **N/D**, é excluído do denominador e não altera o score.
 
-**3. Decisão exige evidência.** Com cobertura baixa, o resultado é “DADOS INSUFICIENTES”, e não “bom”.
+### Pesos
+- Cadastro e estabilidade: **20%**
+- Capacidade financeira: **25%**
+- Histórico de pagamento: **30%**
+- Exposição: **15%**
+- Comportamento operacional: **10%**
 
-**4. Fatos negativos comprovados têm efeito.** Situação cadastral irregular, negativações e protestos reduzem o risco conforme as regras.
+### Estados
+- 🟢 **Risco controlado**: score ≥ 80, com cobertura mínima de 50%.
+- 🟡 **Risco moderado**: score de 60 a 79,9, com cobertura mínima de 50%.
+- 🔴 **Risco elevado**: score < 60 ou gatilho forte de risco.
+- ⚪ **Dados insuficientes**: cobertura < 50%.
 
-**5. Faturamento não é inventado pelo CNPJ.** Só entra no cálculo quando informado por fonte confiável.
+### Regra de segurança
+Sem faturamento comprovado, o sistema **não estima receita para liberar crédito**. O limite fica conservador até existir evidência suficiente.
 
-**6. Prazo e entrada dependem da evidência.** Quanto menor a evidência, menor o crédito concedido.
-
-**7. Toda decisão é auditável.** O relatório mostra quais critérios entraram e quais foram desconsiderados.
+A metodologia é um apoio à decisão e deve ser validada pela política financeira da empresa antes de uso operacional.
 """)
 
-elif menu=="Sobre":
-    st.subheader("Versão 6.0")
-    st.write("Motor de análise de crédito empresarial com dados faltantes neutros, cobertura de evidências, regras de bloqueio, condições de pagamento e relatório auditável.")
-    st.caption("As informações externas dependem da disponibilidade e autorização das fontes. O sistema não substitui uma política de crédito formal ou análise humana.")
+def clients():
+    st.title("Clientes")
+    con=db();df=pd.read_sql_query("SELECT cnpj,razao,fantasia,situacao,abertura,porte,segmento,capital,updated_at FROM clients ORDER BY updated_at DESC",con);con.close()
+    if df.empty:st.info("Nenhum cliente.");return
+    df["cnpj"]=df["cnpj"].apply(fmt_cnpj)
+    st.dataframe(df,use_container_width=True,hide_index=True)
 
-st.sidebar.divider()
-st.sidebar.caption("6.0 • dados ausentes = neutros • decisões auditáveis")
+def app():
+    brand()
+    page=st.sidebar.radio("Menu",["Nova análise","Histórico","Clientes","Metodologia 7.0"])
+    st.sidebar.caption("Dados ausentes = N/D; não interferem no score.")
+    if page=="Nova análise":new_analysis()
+    elif page=="Histórico":history()
+    elif page=="Clientes":clients()
+    else:policy()
 
+app()
