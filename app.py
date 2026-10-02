@@ -37,30 +37,6 @@ SEGMENT_FACTORS = {
     "Outro": 0.05,
 }
 
-SERASA_UAT_BASE = "https://uat-api.serasaexperian.com.br/credit-services/business-information-report/v1/reports"
-
-def serasa_uat_test(token, report_name, query_params, timeout=20):
-    """Teste genérico do endpoint UAT informado pelo usuário.
-    Não assume parâmetros proprietários além de reportName.
-    """
-    if not token.strip():
-        return None, "Informe um Bearer Token da Serasa para testar."
-    params = {"reportName": report_name}
-    params.update({k: v for k, v in query_params.items() if str(v).strip()})
-    headers = {
-        "Authorization": token if token.lower().startswith("bearer ") else f"Bearer {token}",
-        "Accept": "application/json",
-    }
-    try:
-        r = requests.get(SERASA_UAT_BASE, params=params, headers=headers, timeout=timeout)
-        try:
-            payload = r.json()
-        except Exception:
-            payload = r.text
-        return {"status_code": r.status_code, "url": r.url, "payload": payload}, None
-    except requests.RequestException as e:
-        return None, f"Erro de conexão: {e}"
-
 def db():
     con = sqlite3.connect(DB)
     con.execute("""CREATE TABLE IF NOT EXISTS clientes(
@@ -82,6 +58,28 @@ def db():
         prazo TEXT,
         decisao TEXT,
         dados TEXT
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS movimentos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cliente_id INTEGER,
+        data TEXT,
+        tipo TEXT,
+        valor REAL,
+        vencimento TEXT,
+        pagamento TEXT,
+        dias_atraso INTEGER DEFAULT 0,
+        observacao TEXT
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS auditoria(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT,
+        usuario TEXT,
+        acao TEXT,
+        entidade TEXT,
+        entidade_id INTEGER,
+        antes TEXT,
+        depois TEXT,
+        motivo TEXT
     )""")
     con.commit()
     return con
@@ -257,6 +255,73 @@ def data_quality_label(coverage, verified_sources):
     return "BAIXA"
 
 
+
+def audit(con, action, entity, entity_id=None, before="", after="", reason=""):
+    con.execute("""INSERT INTO auditoria(data,usuario,acao,entidade,entidade_id,antes,depois,motivo)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(), "operador", action, entity, entity_id,
+                 str(before), str(after), str(reason)))
+    con.commit()
+
+def client_movements(con, client_id):
+    return pd.read_sql_query(
+        "SELECT * FROM movimentos WHERE cliente_id=? ORDER BY data DESC, id DESC",
+        con, params=(client_id,))
+
+def behavior_from_real_history(df):
+    if df.empty:
+        return {"has_history": False, "purchases": 0.0, "late_count": None,
+                "max_late": None, "on_time": None, "open": 0.0}
+    sales = df[df["tipo"].isin(["Venda","Compra"])]
+    purchases = float(sales["valor"].sum()) if not sales.empty else 0.0
+    late = df["dias_atraso"].fillna(0).astype(int)
+    due_count = len(df[df["vencimento"].notna()])
+    on_time = (late.eq(0).sum()/due_count*100) if due_count else None
+    open_amount = float(df.loc[df["pagamento"].fillna("").ne("Pago"), "valor"].sum())
+    return {"has_history": True, "purchases": purchases,
+            "late_count": int(late.gt(0).sum()),
+            "max_late": int(late.max()) if len(late) else 0,
+            "on_time": on_time, "open": open_amount}
+
+def limit_engine(score, risk_level, monthly_revenue, segment, history_12m,
+                 on_time, open_amount, current_limit, requested_order):
+    """
+    Transparent limit engine:
+    1) capacity ceiling from monthly revenue;
+    2) behavior factor from real payment history;
+    3) current exposure deducted;
+    4) hard caps by risk/segment.
+    """
+    if score is None or risk_level in ("ELEVADO", "NÃO CLASSIFICADO"):
+        return 0.0, 0.0, "Sem limite automático por risco/dados."
+    if monthly_revenue <= 0:
+        if history_12m > 0 and (on_time is None or on_time >= 90):
+            base = min(5000.0, history_12m * 0.50)
+        else:
+            return 0.0, 0.0, "Sem faturamento/capacidade financeira suficiente."
+    else:
+        factor = SEGMENT_FACTORS.get(segment, .05)
+        base = monthly_revenue * factor
+
+    if risk_level == "MODERADO":
+        base = min(base, 12000.0)
+    else:
+        base = min(base, 30000.0)
+
+    # Behavior modifier is deliberately modest: history cannot overpower capacity.
+    if history_12m > 0 and on_time is not None:
+        if on_time >= 97: base *= 1.00
+        elif on_time >= 90: base *= 0.90
+        elif on_time >= 80: base *= 0.70
+        else: base *= 0.40
+
+    # Existing exposure reduces available credit.
+    available = max(0.0, round(base - open_amount - current_limit, -2))
+    recommended = max(0.0, round(base, -2))
+    reason = "Capacidade + histórico + exposição."
+    return recommended, available, reason
+
+
 def pdf_report(data, path):
     if not REPORTLAB_OK:
         return False
@@ -280,7 +345,7 @@ con = db()
 st.title("Fratelli Crédito 4.1")
 st.caption("Análise empresarial para decisão de crédito — dados ausentes são excluídos do cálculo.")
 
-menu = st.sidebar.radio("Menu", ["Nova análise", "Teste Serasa UAT", "Histórico", "Clientes", "Metodologia"])
+menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
 if menu == "Nova análise":
     st.subheader("1. Cadastro e consulta")
@@ -304,32 +369,54 @@ if menu == "Nova análise":
     with b: fonte = st.selectbox("Fonte do faturamento", ["Não informado","Documento financeiro","Fonte financeira autorizada","Declaração do cliente"])
     with c: pedido = st.number_input("Valor do pedido (R$)", min_value=0.0, step=100.0)
     with d: prazo_pedido = st.selectbox("Prazo solicitado", ["À vista","30 dias","30/60 dias","60 dias","90 dias"])
-    e1,e2 = st.columns(2)
-    with e1:
-        bureau_source = st.selectbox("Fonte de score externo", ["Não informado","Serasa/SPC — consulta autorizada"])
-    with e2:
-        bureau_score = st.number_input("Score externo (0–1000, se disponível)", min_value=0.0, max_value=1000.0, value=0.0, step=1.0)
 
 
-    st.subheader("3. Histórico e exposição")
+    st.subheader("3. Histórico real e exposição")
+    cnpj_clean = clean_cnpj(cnpj)
+    existing_client = None
+    if cnpj_clean:
+        row = con.execute("SELECT id FROM clientes WHERE cnpj=?", (cnpj_clean,)).fetchone()
+        existing_client = row[0] if row else None
+
+    real_df = client_movements(con, existing_client) if existing_client else pd.DataFrame()
+    real = behavior_from_real_history(real_df)
+    use_real = st.checkbox("Usar histórico real registrado no sistema", value=not real_df.empty)
+
     a,b,c,d = st.columns(4)
-    with a: compras_12m = st.number_input("Compras Fratelli em 12 meses (R$)", min_value=0.0, step=1000.0)
-    with b: aberto = st.number_input("Valor atualmente em aberto (R$)", min_value=0.0, step=500.0)
-    with c: limite_atual = st.number_input("Limite atual (R$)", min_value=0.0, step=500.0)
-    with d: pontualidade = st.number_input("% de pagamentos no prazo", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
-    e,f,g = st.columns(3)
-    with e: atrasos = st.number_input("Quantidade de atrasos", min_value=0, step=1)
-    with f: maior_atraso = st.number_input("Maior atraso (dias)", min_value=0, step=1)
-    with g: restricoes = st.number_input("Restrições/protestos confirmados", min_value=0, step=1)
+    with a:
+        compras_manual = st.number_input("Compras 12 meses (R$)", min_value=0.0, step=1000.0)
+    with b:
+        aberto_manual = st.number_input("Valor em aberto (R$)", min_value=0.0, step=500.0)
+    with c:
+        limite_atual = st.number_input("Limite atual (R$)", min_value=0.0, step=500.0)
+    with d:
+        pontualidade_manual = st.number_input("% no prazo", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
+
+    if use_real and not real_df.empty:
+        compras_12m = real["purchases"]
+        aberto = real["open"]
+        pontualidade = real["on_time"]
+        atrasos = real["late_count"]
+        maior_atraso = real["max_late"]
+        st.success(f"Histórico real encontrado: {len(real_df)} movimento(s).")
+    else:
+        compras_12m = compras_manual
+        aberto = aberto_manual
+        pontualidade = pontualidade_manual
+        atrasos = None
+        maior_atraso = None
+
+    e,f = st.columns(2)
+    with e:
+        restricoes = st.number_input("Restrições/protestos confirmados", min_value=0, step=1)
+    with f:
+        tem_restricoes = st.checkbox("Consulta de restrições confirmada")
 
     st.caption("Se um dado não for conhecido, deixe-o sem informação/zero apenas quando o zero for um fato confirmado. Para análises rigorosas, diferencie 'zero confirmado' de 'não informado'.")
 
     # Explicit checkbox avoids confusing unknown with zero.
-    x,y,z = st.columns(3)
-    with x: tem_historico = st.checkbox("Tenho histórico de pagamentos")
-    with y: tem_pontualidade = st.checkbox("Tenho % de pontualidade confirmado")
-    with z: tem_restricoes = st.checkbox("Tenho consulta de restrições confirmada")
-
+    tem_historico = use_real or st.checkbox("Tenho histórico manual de pagamentos")
+    tem_pontualidade = (pontualidade is not None) and (use_real or st.checkbox("Confirmar % de pontualidade manual"))
     itens = {
         "Cadastro e estabilidade": score_cadastro(
             data.get("descricao_situacao_cadastral"),
@@ -341,9 +428,9 @@ if menu == "Nova análise":
         ),
         "Histórico de pagamento": score_pagamento(
             compras_12m if tem_historico and compras_12m > 0 else None,
-            atrasos if tem_historico else None,
-            maior_atraso if tem_historico else None,
-            pontualidade if tem_pontualidade else None
+            atrasos if tem_historico and atrasos is not None else None,
+            maior_atraso if tem_historico and maior_atraso is not None else None,
+            pontualidade if tem_pontualidade and pontualidade is not None else None
         ),
         "Exposição": score_exposicao(
             faturamento if faturamento > 0 else None,
@@ -355,12 +442,9 @@ if menu == "Nova análise":
     }
     score,cobertura = calc_score(itens)
 
-    # External bureau information is displayed separately to avoid double-counting.
-    bureau_norm = None if bureau_source == "Não informado" or bureau_score <= 0 else round(bureau_score / 10, 1)
     verified_sources = 0
     if data: verified_sources += 1
     if faturamento > 0 and fonte in ("Documento financeiro","Fonte financeira autorizada"): verified_sources += 1
-    if bureau_norm is not None: verified_sources += 1
     if tem_historico: verified_sources += 1
     if tem_restricoes: verified_sources += 1
     quality = data_quality_label(cobertura, verified_sources)
@@ -376,7 +460,19 @@ if menu == "Nova análise":
         largest_delay=(maior_atraso if tem_historico else None),
     )
 
-    limite = limit_credit(score,faturamento if faturamento>0 else None,segmento,compras_12m,atrasos,pontualidade if tem_pontualidade else None)
+    limite = limit_credit(score,faturamento if faturamento>0 else None,segmento,compras_12m,atrasos,pontualidade if tem_pontualidade and pontualidade is not None else None)
+    limite_motor, disponivel_motor, limite_motivo = limit_engine(
+        score, risco, faturamento, segmento, compras_12m,
+        pontualidade if pontualidade is not None else None,
+        aberto, limite_atual, pedido
+    )
+    # 4.3 uses the transparent engine when it has enough inputs.
+    if limite_motor > 0 or risco in ("ELEVADO","NÃO CLASSIFICADO"):
+        limite = limite_motor
+        disponivel = disponivel_motor
+    else:
+        disponivel = max(0, limite - aberto)
+
     disponivel = max(0, limite - aberto)
     prazo, entrada, decisao = conditions(risco,disponivel,pedido)
     if gate == "BLOQUEADO":
@@ -394,11 +490,12 @@ if menu == "Nova análise":
     r2.metric("Cobertura", f"{cobertura}%")
     r3.metric("Risco", risco)
     r4.metric("Limite recomendado", money(limite))
-    st.write(f"**Qualidade dos dados:** {quality}  |  **Score externo:** {'N/D' if bureau_norm is None else f'{bureau_norm:.1f}/100 (apenas informativo)'}")
+    st.write(f"**Qualidade dos dados:** {quality}")
     st.write(f"**Controle de decisão:** {gate} — {gate_reason}")
 
 
     st.write(f"**Limite disponível para este pedido:** {money(disponivel)}")
+    st.caption(f"Motor de limite: {limite_motivo}")
     st.write(f"**Condição sugerida:** {prazo}  |  **Entrada:** {money(entrada)}")
     st.write(f"**Decisão:** {decisao}")
 
@@ -412,8 +509,6 @@ if menu == "Nova análise":
     if fonte == "Declaração do cliente": justificativas.append("Faturamento declarado recebeu confiança menor que documentação financeira.")
     if tem_restricoes and restricoes > 0: justificativas.append(f"Foram informadas {restricoes} restrição(ões)/protesto(s) confirmado(s).")
     if tem_historico and atrasos > 0: justificativas.append(f"Há {atrasos} atraso(s); maior atraso informado: {maior_atraso} dia(s).")
-    if bureau_norm is not None:
-        justificativas.append("Score externo foi mantido separado do score interno para evitar dupla contagem.")
     if quality == "BAIXA":
         justificativas.append("Qualidade de dados baixa: priorizar revisão humana antes de ampliar limite.")
     if not justificativas:
@@ -432,6 +527,10 @@ if menu == "Nova análise":
                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (cid,datetime.now().isoformat(),score,risco,cobertura,limite,disponivel,pedido,prazo,decisao,str(itens)))
         con.commit()
+        audit(con, "CRIAR", "analise", cur.lastrowid, "", {
+            "score": score, "risco": risco, "limite": limite,
+            "disponivel": disponivel, "decisao": decisao
+        }, "Nova análise de crédito")
         st.success("Análise salva com sucesso.")
 
         if REPORTLAB_OK:
@@ -446,54 +545,48 @@ if menu == "Nova análise":
             with open(pdf,"rb") as f:
                 st.download_button("Baixar relatório PDF",f,file_name=pdf.name)
 
-elif menu == "Teste Serasa UAT":
-    st.subheader("Teste de integração — Serasa Experian UAT")
-    st.warning("Este módulo é apenas para homologação. Não coloque client_secret ou outras credenciais permanentes no código.")
+elif menu == "Histórico real":
+    st.subheader("Histórico real de clientes")
+    clients = pd.read_sql_query("SELECT id, cnpj, razao FROM clientes ORDER BY razao", con)
+    if clients.empty:
+        st.info("Nenhum cliente cadastrado ainda.")
+    else:
+        selected = st.selectbox(
+            "Cliente",
+            clients["id"].tolist(),
+            format_func=lambda x: f"{clients.loc[clients.id==x,'razao'].iloc[0]} — {clients.loc[clients.id==x,'cnpj'].iloc[0]}"
+        )
+        df = client_movements(con, selected)
+        st.dataframe(df, use_container_width=True)
+        if not df.empty:
+            real = behavior_from_real_history(df)
+            a,b,c,d = st.columns(4)
+            a.metric("Compras registradas", money(real["purchases"]))
+            b.metric("Atrasos", "N/D" if real["late_count"] is None else real["late_count"])
+            c.metric("Pontualidade", "N/D" if real["on_time"] is None else f"{real['on_time']:.1f}%")
+            d.metric("Em aberto", money(real["open"]))
 
-    st.write("Endpoint base configurado:")
-    st.code(SERASA_UAT_BASE)
-
-    token = st.text_input("Bearer Token", type="password",
-                          help="Cole um token de acesso temporário fornecido pela Serasa. O token não é salvo no banco.")
-    report_name = st.text_input("reportName", value="",
-                                help="Use exatamente o reportName definido na documentação/contrato da Serasa.")
-
-    st.markdown("**Parâmetros adicionais da consulta**")
-    q1, q2, q3 = st.columns(3)
-    with q1:
-        p1_name = st.text_input("Parâmetro 1", value="")
-        p1_value = st.text_input("Valor 1", value="")
-    with q2:
-        p2_name = st.text_input("Parâmetro 2", value="")
-        p2_value = st.text_input("Valor 2", value="")
-    with q3:
-        p3_name = st.text_input("Parâmetro 3", value="")
-        p3_value = st.text_input("Valor 3", value="")
-
-    st.caption("Os nomes dos parâmetros adicionais devem vir da documentação da Serasa. O sistema não inventa o nome do parâmetro do CNPJ.")
-
-    params = {}
-    for n, v in [(p1_name,p1_value),(p2_name,p2_value),(p3_name,p3_value)]:
-        if n.strip() and v.strip():
-            params[n.strip()] = v.strip()
-
-    if st.button("Testar Serasa UAT"):
-        if not report_name.strip():
-            st.error("Informe o reportName.")
-        else:
-            result, err = serasa_uat_test(token, report_name, params)
-            if err:
-                st.error(err)
-            else:
-                st.write(f"HTTP **{result['status_code']}**")
-                if result["status_code"] >= 200 and result["status_code"] < 300:
-                    st.success("Endpoint respondeu com sucesso.")
-                elif result["status_code"] in (401,403):
-                    st.error("A API respondeu, mas a autenticação/credencial não foi aceita.")
-                else:
-                    st.warning("A API respondeu. Veja o corpo abaixo para identificar parâmetros ou permissões necessários.")
-                st.code(str(result["payload"])[:20000], language="json")
-                st.caption(f"URL efetivamente chamada: {result['url']}")
+        st.markdown("### Registrar movimento")
+        with st.form("mov"):
+            data_m = st.date_input("Data")
+            tipo = st.selectbox("Tipo", ["Venda","Pagamento","Compra","Ajuste"])
+            valor = st.number_input("Valor (R$)", min_value=0.0, step=100.0)
+            venc = st.date_input("Vencimento")
+            pag = st.selectbox("Status", ["Em aberto","Pago"])
+            atraso = st.number_input("Dias de atraso", min_value=0, step=1)
+            obs = st.text_input("Observação")
+            save = st.form_submit_button("Registrar")
+        if save:
+            cur = con.cursor()
+            cur.execute("""INSERT INTO movimentos(cliente_id,data,tipo,valor,vencimento,pagamento,dias_atraso,observacao)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (selected,str(data_m),tipo,valor,str(venc),pag,atraso,obs))
+            con.commit()
+            audit(con, "CRIAR", "movimento", cur.lastrowid, "", {
+                "cliente_id": selected, "tipo": tipo, "valor": valor,
+                "pagamento": pag, "dias_atraso": atraso
+            }, "Registro de histórico real")
+            st.success("Movimento registrado.")
 
 elif menu == "Histórico":
     st.subheader("Histórico de análises")
@@ -527,7 +620,11 @@ else:
 
 **Decisão:** o sistema separa risco, limite disponível e condição comercial sugerida.
 
-**Fontes externas:** scores de bureaus (Serasa/SPC) são armazenados como evidência externa e não são somados diretamente ao score interno, evitando dupla contagem.
+**Histórico real:** vendas, pagamentos, vencimentos e atrasos podem ser registrados por cliente e usados diretamente na análise.
+
+**Motor de limite:** combina capacidade, risco, comportamento e exposição. O histórico não pode criar capacidade financeira inexistente.
+
+**Auditoria:** alterações e decisões importantes geram registros de data, ação, entidade, valores e motivo.
 
 **Gates de segurança:** CNPJ não validado, restrição ativa, atraso >90 dias, sinal de fraude ou baixa cobertura podem impedir aprovação automática ou exigir revisão humana.
 
