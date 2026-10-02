@@ -1,31 +1,27 @@
-# Fratelli Crédito 2.0
+# Sistema de Análise de Crédito 3.0
 
-Sistema profissional inicial para decisão de crédito B2B.
+Sistema web em Streamlit para análise de crédito empresarial.
 
-## Executar
+## Novidades
+- Consulta automática de CNPJ.
+- Preenchimento de dados cadastrais disponíveis.
+- Score, risco, limite, prazo e entrada.
+- Histórico de análises.
+- Dashboard.
+- Política de crédito configurável.
+- Exportação CSV.
+- Relatório PDF.
+- Suporte a CNPJ alfanumérico conforme a mudança recente do cadastro.
+- Logo personalizada: coloque um arquivo `logo.png` na mesma pasta do `app.py`.
+
+## Importante
+A consulta cadastral não fornece automaticamente todos os dados necessários para crédito, como faturamento, histórico de pagamentos, exposição e protestos. Esses dados devem vir de fonte autorizada ou de sistemas internos.
+
+## Rodar localmente
+```bash
 pip install -r requirements.txt
 streamlit run app.py
+```
 
-## Motor
-Score 0–100 com:
-- idade da empresa
-- histórico de pagamentos
-- capacidade de pagamento
-- comportamento de atraso
-- relacionamento com a Fratelli
-- cadastro/ocorrências
-- situação cadastral
-- exposição atual
-- limite já utilizado
-- segmento comercial
-
-## Decisão
-O sistema calcula:
-- risco
-- limite disponível
-- prazo
-- entrada necessária
-- decisão: aprovar, aprovar com condição, reduzir limite/entrada ou venda à vista.
-
-## Integração
-A tela Integração CNPJ define a interface para conectar uma API autorizada de dados cadastrais. A API concreta não é incluída porque exige credencial/contrato do provedor.
+## Publicar
+Suba `app.py`, `requirements.txt` e `README.md` para um repositório GitHub e faça o deploy em uma plataforma compatível com Streamlit.
