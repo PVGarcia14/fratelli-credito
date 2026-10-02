@@ -212,6 +212,51 @@ def conditions(risco, limite_disp, pedido):
         return "Entrada + 30 dias", round(pedido*.30, 2), "APROVAÇÃO CONDICIONADA"
     return "À vista", 0, "NÃO APROVADO PARA ESTE PEDIDO"
 
+
+def source_reliability(source):
+    return {
+        "Documento financeiro": 1.00,
+        "Fonte financeira autorizada": 1.00,
+        "Serasa/SPC — consulta autorizada": 1.00,
+        "Open Finance — dados consentidos": 1.00,
+        "Documento cadastral oficial": 0.95,
+        "Histórico interno Fratelli": 0.95,
+        "Declaração do cliente": 0.55,
+        "Não informado": 0.00,
+    }.get(source, 0.50)
+
+def external_score_normalized(score):
+    if score is None:
+        return None
+    return max(0, min(100, float(score)))
+
+def decision_gate(cnpj_ok, score, coverage, restrictions_confirmed, active_restrictions,
+                  largest_delay, fraud_alert=False):
+    """Gates are controls, not extra score points."""
+    if not cnpj_ok:
+        return "BLOQUEADO", "CNPJ não validado."
+    if fraud_alert:
+        return "REVISÃO MANUAL", "Sinal de fraude/alerta cadastral requer revisão humana."
+    if active_restrictions is not None and active_restrictions > 0:
+        if score is not None and score >= 80:
+            return "REVISÃO MANUAL", "Há restrição ativa confirmada; não liberar automaticamente."
+        return "BLOQUEADO", "Há restrição ativa confirmada."
+    if largest_delay is not None and largest_delay > 90:
+        return "REVISÃO MANUAL", "Maior atraso superior a 90 dias."
+    if coverage < 50:
+        return "PENDENTE", "Cobertura de dados inferior a 50%."
+    if score is None:
+        return "PENDENTE", "Score interno não pôde ser calculado."
+    return "OK", "Critérios mínimos atendidos."
+
+def data_quality_label(coverage, verified_sources):
+    if coverage >= 80 and verified_sources >= 3:
+        return "ALTA"
+    if coverage >= 50 and verified_sources >= 2:
+        return "MÉDIA"
+    return "BAIXA"
+
+
 def pdf_report(data, path):
     if not REPORTLAB_OK:
         return False
@@ -259,6 +304,12 @@ if menu == "Nova análise":
     with b: fonte = st.selectbox("Fonte do faturamento", ["Não informado","Documento financeiro","Fonte financeira autorizada","Declaração do cliente"])
     with c: pedido = st.number_input("Valor do pedido (R$)", min_value=0.0, step=100.0)
     with d: prazo_pedido = st.selectbox("Prazo solicitado", ["À vista","30 dias","30/60 dias","60 dias","90 dias"])
+    e1,e2 = st.columns(2)
+    with e1:
+        bureau_source = st.selectbox("Fonte de score externo", ["Não informado","Serasa/SPC — consulta autorizada"])
+    with e2:
+        bureau_score = st.number_input("Score externo (0–1000, se disponível)", min_value=0.0, max_value=1000.0, value=0.0, step=1.0)
+
 
     st.subheader("3. Histórico e exposição")
     a,b,c,d = st.columns(4)
@@ -303,11 +354,38 @@ if menu == "Nova análise":
         ),
     }
     score,cobertura = calc_score(itens)
+
+    # External bureau information is displayed separately to avoid double-counting.
+    bureau_norm = None if bureau_source == "Não informado" or bureau_score <= 0 else round(bureau_score / 10, 1)
+    verified_sources = 0
+    if data: verified_sources += 1
+    if faturamento > 0 and fonte in ("Documento financeiro","Fonte financeira autorizada"): verified_sources += 1
+    if bureau_norm is not None: verified_sources += 1
+    if tem_historico: verified_sources += 1
+    if tem_restricoes: verified_sources += 1
+    quality = data_quality_label(cobertura, verified_sources)
+
     situacao = data.get("descricao_situacao_cadastral","")
     risco = risk(score,situacao,maior_atraso if tem_historico else None)
+    gate, gate_reason = decision_gate(
+        cnpj_ok=bool(data),
+        score=score,
+        coverage=cobertura,
+        restrictions_confirmed=tem_restricoes,
+        active_restrictions=(restricoes if tem_restricoes else None),
+        largest_delay=(maior_atraso if tem_historico else None),
+    )
+
     limite = limit_credit(score,faturamento if faturamento>0 else None,segmento,compras_12m,atrasos,pontualidade if tem_pontualidade else None)
     disponivel = max(0, limite - aberto)
     prazo, entrada, decisao = conditions(risco,disponivel,pedido)
+    if gate == "BLOQUEADO":
+        decisao = "NÃO APROVADO"
+        prazo, entrada = "À vista", 0
+    elif gate in ("REVISÃO MANUAL", "PENDENTE"):
+        decisao = gate
+        prazo, entrada = "Revisão manual / pendente", 0
+
 
     st.divider()
     st.subheader("4. Resultado")
@@ -316,6 +394,9 @@ if menu == "Nova análise":
     r2.metric("Cobertura", f"{cobertura}%")
     r3.metric("Risco", risco)
     r4.metric("Limite recomendado", money(limite))
+    st.write(f"**Qualidade dos dados:** {quality}  |  **Score externo:** {'N/D' if bureau_norm is None else f'{bureau_norm:.1f}/100 (apenas informativo)'}")
+    st.write(f"**Controle de decisão:** {gate} — {gate_reason}")
+
 
     st.write(f"**Limite disponível para este pedido:** {money(disponivel)}")
     st.write(f"**Condição sugerida:** {prazo}  |  **Entrada:** {money(entrada)}")
@@ -331,7 +412,13 @@ if menu == "Nova análise":
     if fonte == "Declaração do cliente": justificativas.append("Faturamento declarado recebeu confiança menor que documentação financeira.")
     if tem_restricoes and restricoes > 0: justificativas.append(f"Foram informadas {restricoes} restrição(ões)/protesto(s) confirmado(s).")
     if tem_historico and atrasos > 0: justificativas.append(f"Há {atrasos} atraso(s); maior atraso informado: {maior_atraso} dia(s).")
-    if not justificativas: justificativas.append("Decisão baseada exclusivamente nos dados efetivamente informados/consultados.")
+    if bureau_norm is not None:
+        justificativas.append("Score externo foi mantido separado do score interno para evitar dupla contagem.")
+    if quality == "BAIXA":
+        justificativas.append("Qualidade de dados baixa: priorizar revisão humana antes de ampliar limite.")
+    if not justificativas:
+        justificativas.append("Decisão baseada exclusivamente em dados efetivamente informados ou consultados.")
+
     st.info(" ".join(justificativas))
 
     if st.button("Salvar análise"):
@@ -419,7 +506,7 @@ elif menu == "Clientes":
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
 else:
-    st.subheader("Metodologia 4.1")
+    st.subheader("Metodologia 4.2")
     st.markdown("""
 **Regra central:** informação ausente não é boa nem ruim. Ela é excluída do cálculo.
 
@@ -439,4 +526,13 @@ else:
 **Restrições:** somente entram no cálculo quando a consulta foi efetivamente confirmada e registrada.
 
 **Decisão:** o sistema separa risco, limite disponível e condição comercial sugerida.
+
+**Fontes externas:** scores de bureaus (Serasa/SPC) são armazenados como evidência externa e não são somados diretamente ao score interno, evitando dupla contagem.
+
+**Gates de segurança:** CNPJ não validado, restrição ativa, atraso >90 dias, sinal de fraude ou baixa cobertura podem impedir aprovação automática ou exigir revisão humana.
+
+**Qualidade dos dados:** cada análise recebe uma classificação de qualidade com base na cobertura e na quantidade de fontes verificadas.
+
+**Princípio de explicabilidade:** toda decisão deve mostrar os dados usados, as fontes, o que ficou de fora e o motivo da decisão.
+
 """)
