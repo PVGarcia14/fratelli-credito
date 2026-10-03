@@ -1,6 +1,8 @@
 import sqlite3
 import json
 import math
+import urllib.parse
+import webbrowser
 from datetime import datetime, date
 from pathlib import Path
 
@@ -19,7 +21,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.9", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
+st.set_page_config(page_title="Fratelli", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -83,6 +85,17 @@ def db():
         depois TEXT,
         motivo TEXT
     )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS pesquisas_publicas(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cliente_id INTEGER,
+        data TEXT,
+        alvo TEXT,
+        nome TEXT,
+        fonte TEXT,
+        resultado TEXT,
+        observacao TEXT,
+        url TEXT
+    )""")
     # Migração leve: mantém bancos 4.x existentes sem exigir API ou reinstalação.
     cols = {r[1] for r in con.execute("PRAGMA table_info(movimentos)").fetchall()}
     if "data_pagamento" not in cols:
@@ -120,7 +133,7 @@ def cnpj_validate_local(cnpj):
     if nums[12] != d1 or nums[13] != d2:
         return None, "CNPJ inválido: dígitos verificadores não conferem."
     formatted = f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
-    return {"cnpj": digits, "cnpj_formatted": formatted}, "CNPJ válido matematicamente. Nenhuma consulta externa foi realizada. Confirme manualmente razão social, situação cadastral e demais dados."
+    return {"cnpj": digits, "cnpj_formatted": formatted}, "CNPJ válido matematicamente. Nenhuma consulta automática foi realizada nesta validação local. Confirme manualmente razão social, situação cadastral e demais dados."
 
 def score_cadastro(situacao, anos):
     vals = []
@@ -294,12 +307,56 @@ def data_quality_label(coverage, verified_sources):
 
 
 
+def public_search_urls(cnpj, name=""):
+    q_cnpj = clean_cnpj(cnpj)
+    q = name.strip() or q_cnpj
+    enc = urllib.parse.quote_plus(q)
+    enc_processos = urllib.parse.quote_plus(f'"{q}" processos')
+    enc_restricoes = urllib.parse.quote_plus(f'"{q}" protesto OR sanção OR insolvência')
+    return [
+        ("Google — pesquisa geral", f"https://www.google.com/search?q={enc}"),
+        ("Google — processos/restrições", f"https://www.google.com/search?q={enc_restricoes}"),
+        ("Jusbrasil — pesquisa processual", f"https://www.jusbrasil.com.br/busca?q={enc_processos}"),
+        ("Serasa — consulta CNPJ", f"https://empresas.serasaexperian.com.br/consulta-gratis/{q_cnpj}" if q_cnpj else "https://empresas.serasaexperian.com.br/"),
+        ("CNPJ.biz — cadastro público", f"https://cnpj.biz/{q_cnpj}" if q_cnpj else "https://cnpj.biz/"),
+    ]
+
+def render_public_research(cnpj, owner_names):
+    st.subheader("Consulta externa e sinais públicos")
+    st.warning("Esta área faz pesquisa pública assistida. Ela não consulta bases privadas de crédito, não revela dívidas privadas e não transforma resultados de busca em fatos automaticamente. Registre somente o que você confirmar na fonte.")
+    if cnpj:
+        st.markdown("**Empresa / CNPJ**")
+        for label, url in public_search_urls(cnpj):
+            st.link_button(label, url, use_container_width=False)
+    names=[n.strip() for n in owner_names if n.strip()]
+    if names:
+        st.markdown("**Sócios/administradores — triagem pública**")
+        st.caption("A pesquisa de pessoas é limitada a fontes públicas e sinais empresariais/judiciais relevantes. Não use esta área para inferir dívida privada, renda, saúde ou outros dados sensíveis.")
+        for name in names:
+            st.write(f"**{name}**")
+            for label, url in public_search_urls("", name):
+                st.link_button(label, url, use_container_width=False)
+
+def save_public_finding(con, cliente_id, alvo, nome, fonte, resultado, observacao, url):
+    cur=con.cursor()
+    cur.execute("INSERT INTO pesquisas_publicas(cliente_id,data,alvo,nome,fonte,resultado,observacao,url) VALUES(?,?,?,?,?,?,?,?)",
+                (cliente_id, datetime.now().isoformat(), alvo, nome, fonte, resultado, observacao, url))
+    con.commit()
+    audit(con,"CRIAR","pesquisa_publica",cur.lastrowid,"",{"alvo":alvo,"nome":nome,"resultado":resultado,"fonte":fonte},"Registro de pesquisa pública confirmado pelo operador")
+    return cur.lastrowid
+
 def audit(con, action, entity, entity_id=None, before="", after="", reason=""):
     con.execute("""INSERT INTO auditoria(data,usuario,acao,entidade,entidade_id,antes,depois,motivo)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (datetime.now().isoformat(), "operador", action, entity, entity_id,
                  str(before), str(after), str(reason)))
     con.commit()
+
+def public_findings_for_cnpj(con, cnpj):
+    cid=con.execute("SELECT id FROM clientes WHERE cnpj=?", (clean_cnpj(cnpj),)).fetchone()
+    if not cid:
+        return pd.DataFrame()
+    return pd.read_sql_query("SELECT * FROM pesquisas_publicas WHERE cliente_id=? ORDER BY id DESC", con, params=(cid[0],))
 
 def client_movements(con, client_id):
     return pd.read_sql_query(
@@ -552,7 +609,7 @@ def pdf_report(data, path):
         except Exception:
             pass
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito 4.9")
+    c.drawString(45,y,"Fratelli Crédito")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -591,14 +648,17 @@ st.markdown("""
 
 if LOGO.exists():
     st.markdown(
-        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli Crédito 4.9</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e sem consultas externas.</div></div></div>',
+        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e com pesquisa pública assistida.</div></div></div>',
         unsafe_allow_html=True
     )
 else:
-    st.title("Fratelli Crédito 4.9")
-    st.caption("Motor de crédito B2B — análise conservadora, explicável e sem consultas externas.")
+    st.title("Fratelli")
+    st.caption("Motor de crédito B2B — análise conservadora, explicável e com pesquisa pública assistida.")
 
-menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
+if LOGO.exists():
+    st.sidebar.image(str(LOGO), width=185)
+st.sidebar.caption("Crédito B2B")
+menu = st.sidebar.radio("Menu", ["Nova análise", "Pesquisa pública", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
 if menu == "Nova análise":
     st.subheader("1. Cadastro da empresa")
@@ -620,6 +680,17 @@ if menu == "Nova análise":
         situacao_manual = st.selectbox("Situação cadastral confirmada", ["Não informado","ATIVA/REGULAR","SUSPENSA/INAPTA","Outra situação"])
         anos_atividade_manual = st.number_input("Anos de atividade confirmados", min_value=0.0, step=1.0, value=0.0)
         cadastro_confirmado = st.checkbox("Cadastro/documentação conferidos pelo operador", value=False)
+
+    st.markdown("### Sócios e administradores")
+    st.caption("Informe os nomes exatamente como aparecem nos documentos/consulta cadastral. O sistema permitirá abrir pesquisas públicas sobre cada nome.")
+    o1,o2,o3 = st.columns(3)
+    with o1: socio_1 = st.text_input("Sócio/administrador 1")
+    with o2: socio_2 = st.text_input("Sócio/administrador 2")
+    with o3: socio_3 = st.text_input("Sócio/administrador 3")
+    owner_names = [socio_1, socio_2, socio_3]
+
+    with st.expander("Pesquisa pública da empresa e dos sócios", expanded=False):
+        render_public_research(cnpj, owner_names)
 
     st.subheader("2. Capacidade financeira e solicitação do cliente")
     a,b,c,d = st.columns(4)
@@ -921,6 +992,33 @@ if menu == "Nova análise":
             with open(pdf,"rb") as f:
                 st.download_button("Baixar relatório PDF",f,file_name=pdf.name)
 
+elif menu == "Pesquisa pública":
+    st.subheader("Pesquisa pública")
+    st.markdown("Use esta área para consultar fontes abertas e registrar somente resultados que você confirmar. O sistema não chama API privada nem afirma que encontrou uma dívida só porque uma busca não retornou resultados.")
+    pc = st.text_input("CNPJ")
+    pnames = st.text_area("Sócios/administradores — um por linha")
+    names = [x.strip() for x in pnames.splitlines() if x.strip()]
+    render_public_research(pc, names)
+    st.divider()
+    st.markdown("### Registrar resultado confirmado")
+    alvo = st.selectbox("Alvo", ["Empresa", "Sócio/administrador"])
+    nome_alvo = st.text_input("Nome do alvo", value=(names[0] if names else ""))
+    fonte_p = st.text_input("Fonte consultada")
+    resultado_p = st.selectbox("Resultado", ["Sem apontamento público confirmado", "Apontamento público confirmado", "Inconclusivo / requer revisão"])
+    url_p = st.text_input("URL da fonte")
+    obs_p = st.text_area("Observação objetiva", help="Descreva apenas o que a fonte efetivamente mostra.")
+    if st.button("Registrar resultado público"):
+        cnpj_reg=clean_cnpj(pc)
+        cid_row=con.execute("SELECT id FROM clientes WHERE cnpj=?", (cnpj_reg,)).fetchone() if cnpj_reg else None
+        cid=cid_row[0] if cid_row else None
+        fid=save_public_finding(con,cid,alvo,nome_alvo,fonte_p,resultado_p,obs_p,url_p)
+        st.success(f"Resultado público registrado #{fid}.")
+    if pc:
+        fdf=public_findings_for_cnpj(con, pc)
+        if not fdf.empty:
+            st.markdown("### Resultados públicos já registrados")
+            st.dataframe(fdf[["data","alvo","nome","fonte","resultado","observacao","url"]], use_container_width=True)
+
 elif menu == "Histórico real":
     st.subheader("Histórico real de clientes")
     clients = pd.read_sql_query("SELECT id, cnpj, razao FROM clientes ORDER BY razao", con)
@@ -978,8 +1076,12 @@ elif menu == "Clientes":
     st.subheader("Clientes cadastrados")
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
+elif menu == "Auditoria":
+    st.subheader("Trilha de auditoria")
+    df = pd.read_sql_query("SELECT * FROM auditoria ORDER BY id DESC", con)
+    st.dataframe(df, use_container_width=True)
 else:
-    st.subheader("Metodologia 4.8")
+    st.subheader("Metodologia")
     st.markdown("""
 **Regra central 4.7:** informação ausente não é excluída do cálculo. Quando um critério relevante não possui evidência suficiente, ele recebe **25% da pontuação máxima daquele critério**. Isso reduz o score e impede que a falta de informação favoreça o cliente.
 
@@ -1017,6 +1119,8 @@ else:
 **Solicitação do cliente:** o valor pedido é um dado independente e é comparado explicitamente com o teto da política. A quantidade de caixas também pode ser informada; cada caixa representa 9 garrafas e o valor é calculado antes da decisão.
 
 **Decisão:** a Central de decisão apresenta primeiro uma instrução operacional clara: NÃO VENDER, NÃO APROVAR, APROVAÇÃO PARCIAL, APROVAR ATÉ X ou revisão manual. O score não é tratado como aprovação automática quando os gates de segurança não são atendidos.
+
+**Pesquisa pública:** o sistema gera pesquisas assistidas para CNPJ e sócios/administradores em fontes abertas. Resultados negativos só entram como evidência quando o operador confirma a fonte e registra a observação. Ausência de resultado não significa ausência de dívida. Consultas privadas de crédito exigem relatório/documento fornecido e autorizado.
 
 **Princípio de explicabilidade:** toda decisão mostra score, cobertura, qualidade, limite, exposição, utilização, inconsistências, dados usados, critérios penalizados e motivo da decisão.
 
