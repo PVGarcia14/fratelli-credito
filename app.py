@@ -5,7 +5,6 @@ from datetime import datetime, date
 from pathlib import Path
 
 import pandas as pd
-import requests
 import streamlit as st
 
 try:
@@ -20,7 +19,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.7", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.8", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -102,21 +101,13 @@ def money(x):
     return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def cnpj_lookup(cnpj):
+    """No external API: validates only the CNPJ format locally.
+    Any cadastral status used in the score must be entered/confirmed by the operator.
+    """
     cnpj = clean_cnpj(cnpj)
     if len(cnpj) != 14:
-        return None, "CNPJ inválido."
-    urls = [
-        f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}",
-        f"https://publica.cnpj.ws/cnpj/{cnpj}",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=10)
-            if r.ok:
-                return r.json(), "Consulta pública realizada."
-        except Exception:
-            pass
-    return None, "Não foi possível consultar o CNPJ agora."
+        return None, "CNPJ deve conter 14 dígitos."
+    return {"cnpj": cnpj}, "CNPJ formatado. Confirme os dados cadastrais manualmente; nenhuma API externa é consultada."
 
 def score_cadastro(situacao, anos):
     vals = []
@@ -207,9 +198,11 @@ def risk(score, situacao, maior_atraso):
         return "ELEVADO"
     if maior_atraso is not None and maior_atraso > 90:
         return "ELEVADO"
-    if score >= 80: return "CONTROLADO"
-    if score >= 60: return "MODERADO"
-    return "ELEVADO"
+    if score < 25: return "MUITO ELEVADO"
+    if score < 35: return "ELEVADO"
+    if score < 45: return "MODERADO-ALTO"
+    if score < 55: return "MODERADO"
+    return "CONTROLADO"
 
 def limit_credit(score, faturamento, segmento, compras_12m, atrasos, pontualidade):
     if score is None or score < 60:
@@ -228,8 +221,10 @@ def limit_credit(score, faturamento, segmento, compras_12m, atrasos, pontualidad
     return max(0, round(bruto, -2))
 
 def conditions(risco, limite_disp, pedido):
-    if risco == "ELEVADO":
+    if risco == "MUITO ELEVADO":
         return "À vista", 0, "CRÉDITO NÃO RECOMENDADO"
+    if risco == "ELEVADO":
+        return "Entrada + 15 dias", round(pedido*.50, 2), "APROVAÇÃO COM CONDIÇÃO"
     if risco == "NÃO CLASSIFICADO":
         return "Pendente de informações", 0, "PENDENTE"
     if pedido <= limite_disp and pedido > 0:
@@ -385,6 +380,64 @@ def contradiction_checks(data, faturamento, pedido, aberto, limite_atual, real):
     return alerts
 
 
+def score_billing_policy(score, requested_order):
+    """Commercial credit policy requested by the business owner.
+    Boundaries: <25 no sale; 25-<35 up to 1,500; 35-<45 up to 5,000;
+    45-<55 up to 10,000; 55-70 up to 20,000; >70 follows the customer's request.
+    """
+    if score is None:
+        return {"band":"SEM SCORE", "ceiling":0.0, "action":"PENDENTE — score indisponível."}
+    score=float(score)
+    requested=max(0.0,float(requested_order or 0))
+    if score < 25:
+        return {"band":"< 25", "ceiling":0.0, "action":"NÃO VENDER — risco muito elevado."}
+    if score < 35:
+        return {"band":"25 a <35", "ceiling":1500.0, "action":"Até R$ 1.500,00."}
+    if score < 45:
+        return {"band":"35 a <45", "ceiling":5000.0, "action":"Até R$ 5.000,00."}
+    if score < 55:
+        return {"band":"45 a <55", "ceiling":10000.0, "action":"Até R$ 10.000,00."}
+    if score <= 70:
+        return {"band":"55 a 70", "ceiling":20000.0, "action":"Até R$ 20.000,00."}
+    return {"band":"> 70", "ceiling":requested, "action":"Valor solicitado pelo cliente, sujeito aos controles de exposição/capacidade."}
+
+
+def compare_request_to_policy(score, requested, policy_ceiling, available_financial, gate):
+    requested=max(0.0,float(requested or 0))
+    policy_ceiling=max(0.0,float(policy_ceiling or 0))
+    available_financial=max(0.0,float(available_financial or 0))
+    if score is None:
+        return {"status":"PENDENTE", "approved":0.0, "gap":requested, "reason":"Sem score."}
+    if score < 25:
+        return {"status":"NÃO APROVADO", "approved":0.0, "gap":requested, "reason":"Score abaixo de 25: política determina não vender."}
+    if gate in ("BLOQUEADO", "PENDENTE", "REVISÃO MANUAL"):
+        return {"status":gate, "approved":0.0, "gap":requested, "reason":"Controle de decisão impede aprovação automática: " + gate}
+    if requested <= 0:
+        return {"status":"SEM PEDIDO", "approved":0.0, "gap":0.0, "reason":"Informe o valor ou quantidade solicitada pelo cliente."}
+    # Score policy defines the commercial ceiling; exposure/capacity can only reduce it.
+    effective=max(0.0,min(policy_ceiling, available_financial))
+    approved=min(requested,effective)
+    gap=max(0.0,requested-approved)
+    if approved >= requested:
+        return {"status":"APROVAÇÃO INTEGRAL", "approved":approved, "gap":0.0,
+                "reason":"Pedido dentro do limite permitido pelo score e pelos controles financeiros."}
+    if approved > 0:
+        return {"status":"APROVAÇÃO PARCIAL", "approved":approved, "gap":gap,
+                "reason":"Pedido excede o limite permitido; aprovar somente o valor conservador calculado."}
+    return {"status":"NÃO APROVADO", "approved":0.0, "gap":requested,
+            "reason":"Não há limite disponível para este pedido."}
+
+
+def box_request_value(boxes, price_montanhas, price_desertos, price_canions):
+    """Calculates request value by Fratelli cases of 9 bottles."""
+    boxes=max(0,int(boxes or 0))
+    if boxes<=0:
+        return {"boxes":0,"bottles":0,"value":0.0,"breakdown":{}}
+    # Equal-mix default is transparent and editable by the operator through unit quantities below.
+    return {"boxes":boxes,"bottles":boxes*9,
+            "value":0.0,
+            "breakdown":{}}
+
 def limit_engine(score, risk_level, monthly_revenue, segment, history_12m,
                  on_time, open_amount, current_limit, requested_order):
     """
@@ -395,11 +448,11 @@ def limit_engine(score, risk_level, monthly_revenue, segment, history_12m,
     - desconta somente a exposição efetivamente em aberto;
     - calcula utilização antes/depois do pedido.
     """
-    if score is None or risk_level in ("ELEVADO", "NÃO CLASSIFICADO"):
+    if score is None or risk_level == "NÃO CLASSIFICADO":
         return {
             "recommended": 0.0, "available": 0.0, "post_order": 0.0,
             "utilization_before": None, "utilization_after": None,
-            "reason": "Sem limite automático por risco/dados."
+            "reason": "Sem limite automático por ausência de score."
         }
 
     monthly_revenue = float(monthly_revenue or 0)
@@ -486,7 +539,7 @@ def pdf_report(data, path):
         except Exception:
             pass
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito 4.7")
+    c.drawString(45,y,"Fratelli Crédito 4.8")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -525,11 +578,11 @@ st.markdown("""
 
 if LOGO.exists():
     st.markdown(
-        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli Crédito 4.7</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.</div></div></div>',
+        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli Crédito 4.8</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.</div></div></div>',
         unsafe_allow_html=True
     )
 else:
-    st.title("Fratelli Crédito 4.7")
+    st.title("Fratelli Crédito 4.8")
     st.caption("Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
@@ -549,13 +602,35 @@ if menu == "Nova análise":
         fantasia = st.text_input("Nome fantasia", value=data.get("nome_fantasia",""))
     with c3:
         segmento = st.selectbox("Segmento", list(SEGMENT_FACTORS.keys()))
+        situacao_manual = st.selectbox("Situação cadastral confirmada", ["Não informado","ATIVA/REGULAR","SUSPENSA/INAPTA","Outra situação"])
+        anos_atividade_manual = st.number_input("Anos de atividade confirmados", min_value=0.0, step=1.0, value=0.0)
+        cadastro_confirmado = st.checkbox("Cadastro/documentação conferidos pelo operador", value=False)
 
-    st.subheader("2. Capacidade e pedido")
+    st.subheader("2. Capacidade financeira e solicitação do cliente")
     a,b,c,d = st.columns(4)
     with a: faturamento = st.number_input("Faturamento mensal (R$)", min_value=0.0, step=1000.0)
     with b: fonte = st.selectbox("Fonte do faturamento", ["Não informado","Documento financeiro","Fonte financeira autorizada","Declaração do cliente"])
-    with c: pedido = st.number_input("Valor do pedido (R$)", min_value=0.0, step=100.0)
+    with c: pedido = st.number_input("Valor solicitado pelo cliente (R$)", min_value=0.0, step=100.0, help="Valor efetivamente pedido pelo cliente. Será comparado com o score, o limite de política e a exposição.")
     with d: prazo_pedido = st.selectbox("Prazo solicitado", ["À vista","30 dias","30/60 dias","60 dias","90 dias"])
+
+    with st.expander("Pedido por caixas — 9 garrafas por caixa"):
+        st.caption("Informe a quantidade de caixas solicitada. O sistema calcula o valor e compara automaticamente com a política de crédito.")
+        q1,q2,q3,q4 = st.columns(4)
+        with q1: caixas_montanhas = st.number_input("Montanhas — caixas", min_value=0, step=1, key="cx_montanhas")
+        with q2: caixas_desertos = st.number_input("Desertos — caixas", min_value=0, step=1, key="cx_desertos")
+        with q3: caixas_canions = st.number_input("Cânions — caixas", min_value=0, step=1, key="cx_canions")
+        with q4: desconto_pedido = st.number_input("Desconto comercial (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="desc_pedido")
+        preco_montanhas = st.number_input("Preço unitário Montanhas (R$)", min_value=0.0, value=166.20, step=1.0, key="p_mont")
+        preco_desertos = st.number_input("Preço unitário Desertos (R$)", min_value=0.0, value=162.20, step=1.0, key="p_des")
+        preco_canions = st.number_input("Preço unitário Cânions (R$)", min_value=0.0, value=175.20, step=1.0, key="p_can")
+        total_caixas = int(caixas_montanhas + caixas_desertos + caixas_canions)
+        total_garrafas = total_caixas * 9
+        valor_caixas_bruto = (caixas_montanhas*9*preco_montanhas + caixas_desertos*9*preco_desertos + caixas_canions*9*preco_canions)
+        valor_caixas = valor_caixas_bruto * (1 - desconto_pedido/100)
+        st.write(f"**Solicitação por caixas:** {total_caixas} caixa(s) / {total_garrafas} garrafa(s) / **{money(valor_caixas)}**")
+        usar_caixas = st.checkbox("Usar o valor calculado pelas caixas como pedido solicitado", value=False, key="usar_caixas")
+        if usar_caixas:
+            pedido = float(valor_caixas)
 
 
     st.subheader("3. Histórico real e exposição")
@@ -615,8 +690,8 @@ if menu == "Nova análise":
                              pontualidade if tem_pontualidade and pontualidade is not None else None))
     itens = {
         "Cadastro e estabilidade": score_cadastro(
-            data.get("descricao_situacao_cadastral"),
-            ((datetime.now()-datetime.strptime(data["data_inicio_atividade"], "%Y-%m-%d")).days/365.25 if data.get("data_inicio_atividade") else None)
+            (data.get("descricao_situacao_cadastral") or (situacao_manual if situacao_manual != "Não informado" else None)),
+            (anos_atividade_manual if anos_atividade_manual > 0 else ((datetime.now()-datetime.strptime(data["data_inicio_atividade"], "%Y-%m-%d")).days/365.25 if data.get("data_inicio_atividade") else None))
         ),
         "Capacidade financeira": score_capacidade(
             faturamento if faturamento > 0 else None,
@@ -634,17 +709,17 @@ if menu == "Nova análise":
     score,cobertura,criterios_sem_evidencia = calc_score(itens)
 
     verified_sources = 0
-    if data: verified_sources += 1
+    if cadastro_confirmado: verified_sources += 1
     if faturamento > 0 and fonte in ("Documento financeiro","Fonte financeira autorizada"): verified_sources += 1
     if tem_historico: verified_sources += 1
     if tem_restricoes: verified_sources += 1
     quality = data_quality_label(cobertura, verified_sources)
     inconsistencias = contradiction_checks(data, faturamento, pedido, aberto, limite_atual, real)
 
-    situacao = data.get("descricao_situacao_cadastral","")
+    situacao = data.get("descricao_situacao_cadastral","") or (situacao_manual if situacao_manual != "Não informado" else "")
     risco = risk(score,situacao,maior_atraso if tem_historico else None)
     gate, gate_reason = decision_gate(
-        cnpj_ok=bool(data),
+        cnpj_ok=bool(data) and cadastro_confirmado,
         score=score,
         coverage=cobertura,
         restrictions_confirmed=tem_restricoes,
@@ -655,42 +730,74 @@ if menu == "Nova análise":
         gate = "REVISÃO MANUAL"
         gate_reason = "Inconsistências internas detectadas: " + " | ".join(inconsistencias)
 
-    limite = limit_credit(score,faturamento if faturamento>0 else None,segmento,compras_12m,atrasos,pontualidade if tem_pontualidade and pontualidade is not None else None)
+    # Motor financeiro interno: capacidade/exposição.
     motor = limit_engine(
         score, risco, faturamento, segmento, compras_12m,
         pontualidade if pontualidade is not None else None,
         aberto, limite_atual, pedido
     )
-    limite = motor["recommended"]
-    disponivel = motor["available"]
-    limite_motivo = motor["reason"]
+    capacidade_limite = motor["recommended"]
+    capacidade_disponivel = motor["available"]
 
-    decisao_financeira, valor_aprovado = order_decision(
-        disponivel, pedido, gate, risco
-    )
+    # Nova política comercial explícita por faixa de score.
+    policy = score_billing_policy(score, pedido)
+    # Para >70 a política usa o pedido como referência; para faixas inferiores é teto fixo.
+    if score is not None and score > 70:
+        policy_ceiling = float(pedido or 0)
+    else:
+        policy_ceiling = float(policy["ceiling"])
+    # Quando não há capacidade financeira comprovável, a política de score continua visível,
+    # mas não inventamos capacidade. Para score >70, o pedido continua sujeito à exposição/capacidade.
+    if capacidade_limite > 0:
+        financial_available = capacidade_disponivel
+    else:
+        # Sem capacidade financeira demonstrada, não inventar disponibilidade.
+        financial_available = 0.0
+    comparison = compare_request_to_policy(score, pedido, policy_ceiling, financial_available, gate)
+    limite = policy_ceiling
+    disponivel = max(0.0, policy_ceiling - aberto)
+    # Exposição é um controle independente e nunca é contada duas vezes.
+    if capacidade_limite > 0:
+        disponivel = min(disponivel, capacidade_disponivel)
+    valor_aprovado = comparison["approved"]
+    decisao_financeira = comparison["status"]
 
     prazo, entrada, decisao = conditions(risco,disponivel,pedido)
-    if gate == "BLOQUEADO":
-        decisao = "NÃO APROVADO"
-        prazo, entrada = "À vista", 0
-    elif gate in ("REVISÃO MANUAL", "PENDENTE"):
-        decisao = gate
-        prazo, entrada = "Revisão manual / pendente", 0
+    if decisao_financeira in ("NÃO APROVADO", "BLOQUEADO", "PENDENTE", "REVISÃO MANUAL"):
+        decisao = decisao_financeira
+        prazo, entrada = ("À vista", 0) if decisao_financeira == "NÃO APROVADO" else ("Revisão manual / pendente", 0)
     elif decisao_financeira == "APROVAÇÃO PARCIAL":
         decisao = "APROVAÇÃO PARCIAL"
         prazo, entrada = "Revisão/condição comercial", 0
-    elif decisao_financeira == "NÃO APROVADO PARA ESTE PEDIDO":
-        decisao = decisao_financeira
-        prazo, entrada = "À vista", 0
+    elif decisao_financeira == "APROVAÇÃO INTEGRAL":
+        decisao = "APROVADO"
 
 
     st.divider()
-    st.subheader("4. Resultado")
-    r1,r2,r3,r4 = st.columns(4)
-    r1.metric("Score", "N/D" if score is None else score)
+    st.subheader("4. Central de decisão")
+    # Decision card first: user should not have to interpret several lines to know what to do.
+    if score is not None and score < 25:
+        st.error(f"### NÃO VENDER\nScore {score:.1f} — abaixo de 25. A política bloqueia qualquer faturamento a prazo.")
+    elif decisao_financeira == "APROVAÇÃO INTEGRAL":
+        st.success(f"### APROVAR ATÉ {money(valor_aprovado)}\nO pedido solicitado está dentro do limite permitido pela política e pelos controles financeiros.")
+    elif decisao_financeira == "APROVAÇÃO PARCIAL":
+        st.warning(f"### APROVAÇÃO PARCIAL: {money(valor_aprovado)}\nO cliente solicitou {money(pedido)}. O excedente de {money(comparison['gap'])} não deve ser faturado sem nova análise.")
+    elif decisao_financeira in ("PENDENTE", "REVISÃO MANUAL"):
+        st.warning(f"### {decisao_financeira}\nO sistema não recomenda liberar crédito automaticamente. Limite de política calculado: {money(policy_ceiling)}.")
+    elif decisao_financeira == "NÃO APROVADO":
+        st.error(f"### NÃO APROVAR\nPedido solicitado: {money(pedido)}. Limite permitido nesta análise: {money(policy_ceiling)}.")
+    else:
+        st.info(f"### LIMITE SUGERIDO: {money(policy_ceiling)}\nInforme a solicitação do cliente para obter a decisão final.")
+
+    r1,r2,r3,r4,r5 = st.columns(5)
+    r1.metric("Score", "N/D" if score is None else f"{score:.1f}")
     r2.metric("Cobertura", f"{cobertura}%")
     r3.metric("Risco", risco)
-    r4.metric("Limite recomendado", money(limite))
+    r4.metric("Teto por score", money(policy_ceiling))
+    r5.metric("Valor solicitado", money(pedido))
+
+    st.write(f"**Faixa da política:** {policy['band']} — {policy['action']}")
+    st.write(f"**Comparação solicitação × política:** solicitado {money(pedido)} | permitido pela faixa {money(policy_ceiling)} | aprovado nesta análise {money(valor_aprovado)}")
     st.write(f"**Qualidade dos dados:** {quality}")
     dso = dso_estimate(real, faturamento)
     st.write(f"**DSO estimado:** {'N/D' if dso is None else f'{dso:.1f} dias'}")
@@ -699,43 +806,46 @@ if menu == "Nova análise":
     if inconsistencias:
         st.warning("**Inconsistências para revisão:** " + " | ".join(inconsistencias))
 
-
-    st.write(f"**Limite aprovado total:** {money(limite)}")
+    st.write(f"**Limite comercial por score:** {money(policy_ceiling)}")
+    st.write(f"**Limite financeiro calculado:** {money(capacidade_limite)}")
     st.write(f"**Exposição atual:** {money(aberto)}")
     st.write(f"**Limite disponível antes do pedido:** {money(disponivel)}")
     st.write(f"**Pedido solicitado:** {money(pedido)}")
     st.write(f"**Valor financeiro aprovado:** {money(valor_aprovado)}")
-    if motor["utilization_before"] is not None:
-        st.write(f"**Utilização antes do pedido:** {motor['utilization_before']:.1f}%")
-        st.write(f"**Utilização após o pedido:** {motor['utilization_after']:.1f}%")
-    st.caption(f"Motor de limite: {limite_motivo}")
+    if capacidade_limite > 0 and motor["utilization_before"] is not None:
+        st.write(f"**Utilização financeira antes do pedido:** {motor['utilization_before']:.1f}%")
+        st.write(f"**Utilização financeira após o pedido:** {motor['utilization_after']:.1f}%")
+    st.caption(f"Motor financeiro: {motor['reason']}")
     if criterios_sem_evidencia:
         st.warning(
             "**Penalização por ausência de informação:** "
             + "; ".join(f"{c}: 25%" for c in criterios_sem_evidencia)
             + ". Esses critérios contribuíram com somente 25% da pontuação máxima."
         )
-    st.write(f"**Decisão financeira:** {decisao_financeira}")
-    st.write(f"**Condição sugerida:** {prazo}  |  **Entrada:** {money(entrada)}")
+    st.write(f"**Decisão financeira:** {decisao_financeira} — {comparison['reason']}")
+    st.write(f"**Condição sugerida:** {prazo} | **Entrada:** {money(entrada)}")
     st.write(f"**Decisão final:** {decisao}")
 
-    with st.expander("Simulação financeira do pedido"):
-        st.markdown(
-            "Simule o impacto de um pedido usando apenas o valor financeiro. "
-            "O motor de risco não presume produto, preço, desconto ou embalagem."
-        )
-        sim_pedido = st.number_input(
-            "Valor financeiro simulado do pedido (R$)",
-            min_value=0.0, value=float(pedido or 0), step=100.0,
-            key="sim_pedido_47"
-        )
-        sim_decisao, sim_aprovado = order_decision(
-            disponivel, sim_pedido, gate, risco
-        )
-        sim_pos = max(0.0, disponivel - sim_pedido)
-        st.metric("Valor aprovado na simulação", money(sim_aprovado))
-        st.write(f"**Resultado:** {sim_decisao}")
-        st.write(f"**Saldo disponível após a simulação:** {money(sim_pos)}")
+    with st.expander("Simulação financeira do pedido", expanded=True):
+        st.markdown("Simule **qualquer valor** ou uma nova quantidade de caixas. O sistema recalcula a decisão imediatamente e compara a solicitação com o score, o teto da política, a exposição e o limite financeiro disponível.")
+        s1,s2 = st.columns(2)
+        with s1:
+            sim_valor = st.number_input("Valor a simular (R$)", min_value=0.0, value=float(pedido or 0), step=100.0, key="sim_valor_48")
+        with s2:
+            sim_caixas = st.number_input("Ou quantidade total de caixas", min_value=0, value=0, step=1, key="sim_caixas_48")
+        if sim_caixas > 0:
+            sim_valor = sim_caixas * 9 * ((preco_montanhas + preco_desertos + preco_canions) / 3.0) * (1-desconto_pedido/100)
+        sim_cmp = compare_request_to_policy(score, sim_valor, policy_ceiling if score is not None and score <=70 else sim_valor, financial_available, gate)
+        sim_pos = max(0.0, disponivel - sim_valor)
+        a,b,c = st.columns(3)
+        a.metric("Solicitação simulada", money(sim_valor))
+        b.metric("Valor aprovado", money(sim_cmp["approved"]))
+        c.metric("Saldo após simulação", money(sim_pos))
+        st.write(f"**Resultado da simulação:** {sim_cmp['status']}")
+        st.write(f"**Motivo:** {sim_cmp['reason']}")
+        if sim_cmp["gap"] > 0:
+            st.warning(f"**Excedente não aprovado:** {money(sim_cmp['gap'])}")
+
 
     with st.expander("Ver composição do score"):
         for k,v in itens.items():
@@ -854,7 +964,7 @@ elif menu == "Clientes":
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
 else:
-    st.subheader("Metodologia 4.7")
+    st.subheader("Metodologia 4.8")
     st.markdown("""
 **Regra central 4.7:** informação ausente não é excluída do cálculo. Quando um critério relevante não possui evidência suficiente, ele recebe **25% da pontuação máxima daquele critério**. Isso reduz o score e impede que a falta de informação favoreça o cliente.
 
@@ -885,7 +995,13 @@ else:
 
 **Qualidade dos dados:** cada análise recebe uma classificação de qualidade com base na cobertura e na quantidade de fontes verificadas.
 
-**Ausência de informação 4.7:** cada critério sem evidência suficiente recebe 25% da pontuação máxima. A ausência nunca vira pontuação positiva nem é removida do denominador.
+**Ausência de informação 4.8:** cada critério sem evidência suficiente recebe 25% da pontuação máxima. A ausência nunca vira pontuação positiva nem é removida do denominador.
+
+**Política comercial por score 4.8:** abaixo de 25 = não vender; 25 a <35 = até R$ 1.500; 35 a <45 = até R$ 5.000; 45 a <55 = até R$ 10.000; 55 a 70 = até R$ 20.000; acima de 70 = valor solicitado pelo cliente, sempre sujeito aos controles de exposição/capacidade e aos gates de segurança.
+
+**Solicitação do cliente:** o valor pedido é um dado independente e é comparado explicitamente com o teto da política. A quantidade de caixas também pode ser informada; cada caixa representa 9 garrafas e o valor é calculado antes da decisão.
+
+**Decisão:** a Central de decisão apresenta primeiro uma instrução operacional clara: NÃO VENDER, NÃO APROVAR, APROVAÇÃO PARCIAL, APROVAR ATÉ X ou revisão manual. O score não é tratado como aprovação automática quando os gates de segurança não são atendidos.
 
 **Princípio de explicabilidade:** toda decisão mostra score, cobertura, qualidade, limite, exposição, utilização, inconsistências, dados usados, critérios penalizados e motivo da decisão.
 
