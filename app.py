@@ -1,5 +1,7 @@
 import sqlite3
-from datetime import datetime
+import json
+import math
+from datetime import datetime, date
 from pathlib import Path
 
 import pandas as pd
@@ -17,7 +19,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.4", page_icon="💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.5", page_icon="💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -81,6 +83,14 @@ def db():
         depois TEXT,
         motivo TEXT
     )""")
+    # Migração leve: mantém bancos 4.x existentes sem exigir API ou reinstalação.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(movimentos)").fetchall()}
+    if "data_pagamento" not in cols:
+        con.execute("ALTER TABLE movimentos ADD COLUMN data_pagamento TEXT")
+    if "documento" not in cols:
+        con.execute("ALTER TABLE movimentos ADD COLUMN documento TEXT")
+    if "categoria" not in cols:
+        con.execute("ALTER TABLE movimentos ADD COLUMN categoria TEXT")
     con.commit()
     return con
 
@@ -126,34 +136,40 @@ def score_cadastro(situacao, anos):
     return sum(vals)/len(vals) if vals else None
 
 def score_capacidade(faturamento, fonte, pedido):
-    # Faturamento autodeclarado é exibido, mas não recebe a mesma confiança
-    # de documento financeiro. Ainda pode servir como sinal, nunca como "fato".
     if faturamento is None or faturamento <= 0:
         return None
+    if fonte == "Não informado":
+        return None
     if pedido <= 0:
-        return 70
+        base = 75 if fonte == "Declaração do cliente" else 90
+        return base
     ratio = pedido / faturamento
     base = 100 if ratio <= .03 else 90 if ratio <= .05 else 75 if ratio <= .08 else 55 if ratio <= .12 else 30
     if fonte == "Declaração do cliente":
-        base = min(base, 70)
+        base = min(base, 65)
     return base
 
-def score_pagamento(compras, atrasos, maior_atraso, pontualidade):
-    vals = []
-    if compras is not None and compras > 0:
-        vals.append(80 if compras >= 12 else 65)
-    if atrasos is not None:
-        vals.append(100 if atrasos == 0 else 70 if atrasos <= 2 else 40 if atrasos <= 5 else 15)
-    if maior_atraso is not None:
-        vals.append(100 if maior_atraso == 0 else 80 if maior_atraso <= 7 else 60 if maior_atraso <= 30 else 30 if maior_atraso <= 90 else 0)
-    if pontualidade is not None:
-        vals.append(max(0, min(100, pontualidade)))
-    return sum(vals)/len(vals) if vals else None
 
-def score_exposicao(faturamento, aberto, limite_atual):
-    if faturamento is None or faturamento <= 0:
+def score_pagamento(compras, atrasos, maior_atraso, pontualidade):
+    vals=[]
+    if atrasos is not None or maior_atraso is not None or pontualidade is not None:
+        if atrasos is not None:
+            vals.append(100 if atrasos==0 else 70 if atrasos<=2 else 40 if atrasos<=5 else 15)
+        if maior_atraso is not None:
+            vals.append(100 if maior_atraso==0 else 80 if maior_atraso<=7 else 60 if maior_atraso<=30 else 30 if maior_atraso<=90 else 0)
+        if pontualidade is not None:
+            vals.append(max(0,min(100,pontualidade)))
+    if not vals:
         return None
-    exposicao = (aberto + max(limite_atual, 0)) / faturamento
+    return round(sum(vals)/len(vals),1)
+
+
+def score_exposicao(faturamento, aberto, limite_atual=0):
+    if faturamento is None or faturamento <= 0 or aberto is None:
+        return None
+    # O limite disponível é derivado do limite aprovado; o limite atual não é
+    # somado à exposição, evitando dupla contagem.
+    exposicao = max(0.0, aberto) / faturamento
     return 100 if exposicao <= .03 else 85 if exposicao <= .06 else 70 if exposicao <= .10 else 45 if exposicao <= .15 else 20
 
 def score_operacional(restricoes, fonte_restricoes):
@@ -269,19 +285,91 @@ def client_movements(con, client_id):
         con, params=(client_id,))
 
 def behavior_from_real_history(df):
+    """Métricas de comportamento usando somente títulos de venda/compra.
+    Pagamentos não viram artificialmente novas contas nem aumentam exposição.
+    """
     if df.empty:
         return {"has_history": False, "purchases": 0.0, "late_count": None,
-                "max_late": None, "on_time": None, "open": 0.0}
-    sales = df[df["tipo"].isin(["Venda","Compra"])]
-    purchases = float(sales["valor"].sum()) if not sales.empty else 0.0
-    late = df["dias_atraso"].fillna(0).astype(int)
-    due_count = len(df[df["vencimento"].notna()])
-    on_time = (late.eq(0).sum()/due_count*100) if due_count else None
-    open_amount = float(df.loc[df["pagamento"].fillna("").ne("Pago"), "valor"].sum())
-    return {"has_history": True, "purchases": purchases,
-            "late_count": int(late.gt(0).sum()),
-            "max_late": int(late.max()) if len(late) else 0,
-            "on_time": on_time, "open": open_amount}
+                "max_late": None, "avg_late": None, "on_time": None,
+                "open": 0.0, "overdue_open": 0.0, "paid_titles": 0,
+                "total_titles": 0, "last_sale": None, "last_payment": None,
+                "max_purchase": 0.0}
+    work=df.copy()
+    work["valor"]=pd.to_numeric(work["valor"], errors="coerce").fillna(0.0)
+    work["dias_atraso"]=pd.to_numeric(work["dias_atraso"], errors="coerce").fillna(0).astype(int)
+    titles=work[work["tipo"].isin(["Venda","Compra"])].copy()
+    purchases=float(titles["valor"].sum()) if not titles.empty else 0.0
+    total_titles=len(titles)
+    paid=titles[titles["pagamento"].fillna("").eq("Pago")]
+    unpaid=titles[~titles["pagamento"].fillna("").eq("Pago")]
+    late=titles[titles["dias_atraso"]>0]
+    on_time=(len(paid[paid["dias_atraso"]<=0])/len(paid)*100) if len(paid) else None
+    open_amount=float(unpaid["valor"].sum()) if not unpaid.empty else 0.0
+    overdue_open=float(unpaid.loc[unpaid["dias_atraso"]>0,"valor"].sum()) if not unpaid.empty else 0.0
+    dates=pd.to_datetime(titles["data"], errors="coerce")
+    pay_dates=pd.to_datetime(work.loc[work["tipo"].eq("Pagamento"),"data"], errors="coerce")
+    return {
+        "has_history": True, "purchases": purchases,
+        "late_count": int(len(late)) if total_titles else None,
+        "max_late": int(titles["dias_atraso"].max()) if total_titles else None,
+        "avg_late": float(late["dias_atraso"].mean()) if len(late) else 0.0,
+        "on_time": on_time, "open": open_amount, "overdue_open": overdue_open,
+        "paid_titles": int(len(paid)), "total_titles": int(total_titles),
+        "last_sale": dates.max().date().isoformat() if dates.notna().any() else None,
+        "last_payment": pay_dates.max().date().isoformat() if pay_dates.notna().any() else None,
+        "max_purchase": float(titles["valor"].max()) if total_titles else 0.0,
+    }
+
+def payment_evidence_score(real, manual_confirmed=False):
+    """Score de comportamento: quantidade, pontualidade e severidade dos atrasos.
+    Retorna None quando não há evidência suficiente.
+    """
+    if not real.get("has_history") and not manual_confirmed:
+        return None
+    total=real.get("total_titles",0)
+    on=real.get("on_time")
+    maxlate=real.get("max_late")
+    if total < 3 and on is None and maxlate is None:
+        return None
+    components=[]
+    if total >= 3:
+        components.append(min(100, 60 + min(total,12)*3))
+    if on is not None:
+        components.append(max(0,min(100,on)))
+    if maxlate is not None:
+        components.append(100 if maxlate==0 else 85 if maxlate<=7 else 70 if maxlate<=30 else 45 if maxlate<=60 else 20 if maxlate<=90 else 0)
+    return round(sum(components)/len(components),1) if components else None
+
+def dso_estimate(real, monthly_revenue):
+    """DSO aproximado, somente quando há receita e exposição reais suficientes."""
+    rev=float(monthly_revenue or 0)
+    if rev<=0 or not real.get("has_history"):
+        return None
+    open_amount=float(real.get("open",0) or 0)
+    return round(open_amount/rev*30,1)
+
+def risk_trend(real):
+    """Sinal de tendência, não soma pontos ao score. Usa apenas o histórico interno."""
+    if not real.get("has_history") or real.get("total_titles",0)<3:
+        return "N/D"
+    if (real.get("max_late") or 0)>90 or (real.get("on_time") is not None and real["on_time"]<80):
+        return "PIORA / ALERTA"
+    if real.get("on_time") is not None and real["on_time"]>=95 and (real.get("max_late") or 0)<=7:
+        return "ESTÁVEL / FAVORÁVEL"
+    return "ESTÁVEL"
+
+def contradiction_checks(data, faturamento, pedido, aberto, limite_atual, real):
+    alerts=[]
+    if faturamento>0 and pedido>faturamento:
+        alerts.append("Pedido superior ao faturamento mensal informado.")
+    if limite_atual>0 and aberto>limite_atual*1.05:
+        alerts.append("Exposição aberta acima do limite atual informado.")
+    if real.get("has_history") and real.get("purchases",0)>0 and faturamento>0 and real["purchases"]>faturamento*24:
+        alerts.append("Histórico acumulado muito acima do faturamento mensal informado; verificar período/fonte.")
+    if real.get("has_history") and real.get("total_titles",0)>=3 and real.get("on_time") is not None and real["on_time"]>100:
+        alerts.append("Percentual de pontualidade inconsistente.")
+    return alerts
+
 
 def limit_engine(score, risk_level, monthly_revenue, segment, history_12m,
                  on_time, open_amount, current_limit, requested_order):
@@ -378,7 +466,7 @@ def pdf_report(data, path):
     w,h = A4
     y = h-50
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito 4.3")
+    c.drawString(45,y,"Fratelli Crédito 4.5")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -391,7 +479,7 @@ def pdf_report(data, path):
 
 con = db()
 
-st.title("Fratelli Crédito 4.4")
+st.title("Fratelli Crédito 4.5")
 st.caption("Motor de crédito B2B — dados ausentes são excluídos do cálculo; o limite financeiro é separado da exposição atual.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
@@ -440,6 +528,7 @@ if menu == "Nova análise":
         limite_atual = st.number_input("Limite atual (R$)", min_value=0.0, step=500.0)
     with d:
         pontualidade_manual = st.number_input("% no prazo", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
+        confirmar_pontualidade_manual = st.checkbox("Confirmar % manual")
 
     if use_real and not real_df.empty:
         compras_12m = real["purchases"]
@@ -448,6 +537,8 @@ if menu == "Nova análise":
         atrasos = real["late_count"]
         maior_atraso = real["max_late"]
         st.success(f"Histórico real encontrado: {len(real_df)} movimento(s).")
+        if real.get("avg_late") is not None:
+            st.caption(f"Atraso médio dos títulos atrasados: {real['avg_late']:.1f} dias | Maior compra registrada: {money(real['max_purchase'])} | Tendência: {risk_trend(real)}")
     else:
         compras_12m = compras_manual
         aberto = aberto_manual
@@ -465,7 +556,13 @@ if menu == "Nova análise":
 
     # Explicit checkbox avoids confusing unknown with zero.
     tem_historico = use_real or st.checkbox("Tenho histórico manual de pagamentos")
-    tem_pontualidade = (pontualidade is not None) and (use_real or st.checkbox("Confirmar % de pontualidade manual"))
+    tem_pontualidade = (pontualidade is not None) and (use_real or confirmar_pontualidade_manual)
+    payment_component = (payment_evidence_score(real, manual_confirmed=tem_historico)
+                         if use_real else score_pagamento(
+                             compras_12m if tem_historico and compras_12m > 0 else None,
+                             atrasos if tem_historico and atrasos is not None else None,
+                             maior_atraso if tem_historico and maior_atraso is not None else None,
+                             pontualidade if tem_pontualidade and pontualidade is not None else None))
     itens = {
         "Cadastro e estabilidade": score_cadastro(
             data.get("descricao_situacao_cadastral"),
@@ -475,12 +572,7 @@ if menu == "Nova análise":
             faturamento if faturamento > 0 else None,
             fonte, pedido
         ),
-        "Histórico de pagamento": score_pagamento(
-            compras_12m if tem_historico and compras_12m > 0 else None,
-            atrasos if tem_historico and atrasos is not None else None,
-            maior_atraso if tem_historico and maior_atraso is not None else None,
-            pontualidade if tem_pontualidade and pontualidade is not None else None
-        ),
+        "Histórico de pagamento": payment_component,
         "Exposição": score_exposicao(
             faturamento if faturamento > 0 else None,
             aberto, limite_atual
@@ -497,6 +589,7 @@ if menu == "Nova análise":
     if tem_historico: verified_sources += 1
     if tem_restricoes: verified_sources += 1
     quality = data_quality_label(cobertura, verified_sources)
+    inconsistencias = contradiction_checks(data, faturamento, pedido, aberto, limite_atual, real)
 
     situacao = data.get("descricao_situacao_cadastral","")
     risco = risk(score,situacao,maior_atraso if tem_historico else None)
@@ -508,6 +601,9 @@ if menu == "Nova análise":
         active_restrictions=(restricoes if tem_restricoes else None),
         largest_delay=(maior_atraso if tem_historico else None),
     )
+    if inconsistencias and gate == "OK":
+        gate = "REVISÃO MANUAL"
+        gate_reason = "Inconsistências internas detectadas: " + " | ".join(inconsistencias)
 
     limite = limit_credit(score,faturamento if faturamento>0 else None,segmento,compras_12m,atrasos,pontualidade if tem_pontualidade and pontualidade is not None else None)
     motor = limit_engine(
@@ -546,7 +642,12 @@ if menu == "Nova análise":
     r3.metric("Risco", risco)
     r4.metric("Limite recomendado", money(limite))
     st.write(f"**Qualidade dos dados:** {quality}")
+    dso = dso_estimate(real, faturamento)
+    st.write(f"**DSO estimado:** {'N/D' if dso is None else f'{dso:.1f} dias'}")
+    st.write(f"**Tendência de comportamento:** {risk_trend(real)}")
     st.write(f"**Controle de decisão:** {gate} — {gate_reason}")
+    if inconsistencias:
+        st.warning("**Inconsistências para revisão:** " + " | ".join(inconsistencias))
 
 
     st.write(f"**Limite aprovado total:** {money(limite)}")
@@ -659,14 +760,18 @@ elif menu == "Histórico real":
             valor = st.number_input("Valor (R$)", min_value=0.0, step=100.0)
             venc = st.date_input("Vencimento")
             pag = st.selectbox("Status", ["Em aberto","Pago"])
+            data_pag = st.date_input("Data do pagamento", value=date.today()) if pag == "Pago" else None
             atraso = st.number_input("Dias de atraso", min_value=0, step=1)
+            categoria = st.selectbox("Categoria", ["Venda/Receita","Pagamento","Ajuste","Outro"])
+            documento = st.text_input("Nº do documento / referência")
             obs = st.text_input("Observação")
             save = st.form_submit_button("Registrar")
         if save:
             cur = con.cursor()
-            cur.execute("""INSERT INTO movimentos(cliente_id,data,tipo,valor,vencimento,pagamento,dias_atraso,observacao)
-                           VALUES(?,?,?,?,?,?,?,?)""",
-                        (selected,str(data_m),tipo,valor,str(venc),pag,atraso,obs))
+            cur.execute("""INSERT INTO movimentos(cliente_id,data,tipo,valor,vencimento,pagamento,dias_atraso,observacao,data_pagamento,documento,categoria)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (selected,str(data_m),tipo,valor,str(venc),pag,atraso,obs,
+                         str(data_pag) if data_pag else None,documento,categoria))
             con.commit()
             audit(con, "CRIAR", "movimento", cur.lastrowid, "", {
                 "cliente_id": selected, "tipo": tipo, "valor": valor,
@@ -685,7 +790,7 @@ elif menu == "Clientes":
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
 else:
-    st.subheader("Metodologia 4.4")
+    st.subheader("Metodologia 4.5")
     st.markdown("""
 **Regra central:** informação ausente não é boa nem ruim. Ela é excluída do cálculo.
 
@@ -706,16 +811,16 @@ else:
 
 **Decisão:** o sistema separa risco, limite aprovado total, exposição, limite disponível, valor solicitado, valor aprovado e decisão financeira. Parâmetros comerciais específicos ficam fora do motor de risco.
 
-**Histórico real:** vendas, pagamentos, vencimentos e atrasos podem ser registrados por cliente e usados diretamente na análise.
+**Histórico real:** títulos de venda/compra são separados de movimentos de pagamento; somente títulos entram no cálculo de exposição e comportamento. O sistema calcula pontualidade, atraso médio, maior atraso, exposição vencida e tendência.
 
-**Motor de limite 4.4:** calcula limite aprovado total, desconta somente a exposição em aberto e apresenta o limite disponível. O limite atual não é subtraído novamente, evitando dupla contagem. O histórico pode moderar o limite, mas não cria capacidade financeira inexistente.
+**Motor de limite 4.5:** calcula limite aprovado total, desconta somente a exposição em aberto e apresenta o limite disponível. O limite atual não é subtraído novamente, evitando dupla contagem. O histórico pode moderar o limite, mas não cria capacidade financeira inexistente.
 
-**Auditoria:** alterações e decisões importantes geram registros de data, ação, entidade, valores e motivo.
+**Auditoria:** decisões e registros importantes geram data, ação, entidade, valores e motivo. O banco local é a fonte operacional e pode ser submetido a backup periódico.
 
-**Gates de segurança:** CNPJ não validado, restrição ativa, atraso >90 dias, sinal de fraude ou baixa cobertura podem impedir aprovação automática ou exigir revisão humana.
+**Gates de segurança:** CNPJ não validado, restrição ativa, atraso >90 dias, baixa cobertura ou inconsistências podem impedir aprovação automática ou exigir revisão humana.
 
 **Qualidade dos dados:** cada análise recebe uma classificação de qualidade com base na cobertura e na quantidade de fontes verificadas.
 
-**Princípio de explicabilidade:** toda decisão deve mostrar os dados usados, as fontes, o que ficou de fora e o motivo da decisão.
+**Princípio de explicabilidade:** toda decisão mostra score, cobertura, qualidade, limite, exposição, utilização, inconsistências, dados usados e motivo da decisão. Nenhuma ausência de informação é convertida em ponto positivo ou negativo.
 
 """)
