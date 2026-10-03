@@ -19,7 +19,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.8", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.9", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -100,14 +100,27 @@ def clean_cnpj(x):
 def money(x):
     return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def cnpj_lookup(cnpj):
-    """No external API: validates only the CNPJ format locally.
-    Any cadastral status used in the score must be entered/confirmed by the operator.
+def cnpj_validate_local(cnpj):
+    """Valida CNPJ somente localmente (formato + dígitos verificadores).
+    Não consulta Receita Federal, Serasa, APIs ou qualquer fonte externa.
+    Situação cadastral e dados da empresa devem ser confirmados pelo operador.
     """
-    cnpj = clean_cnpj(cnpj)
-    if len(cnpj) != 14:
-        return None, "CNPJ deve conter 14 dígitos."
-    return {"cnpj": cnpj}, "CNPJ formatado. Confirme os dados cadastrais manualmente; nenhuma API externa é consultada."
+    digits = clean_cnpj(cnpj)
+    if len(digits) != 14:
+        return None, "CNPJ inválido: informe os 14 dígitos."
+    if len(set(digits)) == 1:
+        return None, "CNPJ inválido: sequência repetida."
+    nums = [int(x) for x in digits]
+    w1 = [5,4,3,2,9,8,7,6,5,4,3,2]
+    r1 = sum(n*w for n,w in zip(nums[:12], w1)) % 11
+    d1 = 0 if r1 < 2 else 11-r1
+    w2 = [6,5,4,3,2,9,8,7,6,5,4,3,2]
+    r2 = sum(n*w for n,w in zip(nums[:13], w2)) % 11
+    d2 = 0 if r2 < 2 else 11-r2
+    if nums[12] != d1 or nums[13] != d2:
+        return None, "CNPJ inválido: dígitos verificadores não conferem."
+    formatted = f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+    return {"cnpj": digits, "cnpj_formatted": formatted}, "CNPJ válido matematicamente. Nenhuma consulta externa foi realizada. Confirme manualmente razão social, situação cadastral e demais dados."
 
 def score_cadastro(situacao, anos):
     vals = []
@@ -539,7 +552,7 @@ def pdf_report(data, path):
         except Exception:
             pass
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito 4.8")
+    c.drawString(45,y,"Fratelli Crédito 4.9")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -578,24 +591,26 @@ st.markdown("""
 
 if LOGO.exists():
     st.markdown(
-        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli Crédito 4.8</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.</div></div></div>',
+        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli Crédito 4.9</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e sem consultas externas.</div></div></div>',
         unsafe_allow_html=True
     )
 else:
-    st.title("Fratelli Crédito 4.8")
-    st.caption("Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.")
+    st.title("Fratelli Crédito 4.9")
+    st.caption("Motor de crédito B2B — análise conservadora, explicável e sem consultas externas.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
 if menu == "Nova análise":
-    st.subheader("1. Cadastro e consulta")
+    st.subheader("1. Cadastro da empresa")
     c1,c2,c3 = st.columns(3)
     with c1:
-        cnpj = st.text_input("CNPJ")
-        if st.button("Consultar CNPJ"):
-            data,msg = cnpj_lookup(cnpj)
+        cnpj = st.text_input("CNPJ", help="O sistema apenas valida o número localmente. Não busca dados cadastrais externos.")
+        if st.button("Validar CNPJ"):
+            data,msg = cnpj_validate_local(cnpj)
             st.session_state["cnpj_data"] = data
-            st.info(msg)
+            (st.success if data else st.error)(msg)
+        elif cnpj and len(clean_cnpj(cnpj)) == 14:
+            st.caption("Validação disponível: clique em **Validar CNPJ**. Esta função é local e não consulta nenhuma API.")
     data = st.session_state.get("cnpj_data") or {}
     with c2:
         razao = st.text_input("Razão social", value=data.get("razao_social",""))
