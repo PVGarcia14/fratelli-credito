@@ -11,6 +11,7 @@ import streamlit as st
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
     REPORTLAB_OK = True
 except Exception:
     REPORTLAB_OK = False
@@ -19,7 +20,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.7", page_icon="💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.7", page_icon=str(LOGO) if LOGO.exists() else "💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -477,9 +478,15 @@ def pdf_report(data, path):
         return False
     c = canvas.Canvas(str(path), pagesize=A4)
     w,h = A4
-    y = h-50
+    y = h-42
+    if LOGO.exists():
+        try:
+            c.drawImage(ImageReader(str(LOGO)), 45, y-45, width=150, height=40, preserveAspectRatio=True, mask="auto")
+            y -= 58
+        except Exception:
+            pass
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito 4.5")
+    c.drawString(45,y,"Fratelli Crédito 4.7")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -492,8 +499,38 @@ def pdf_report(data, path):
 
 con = db()
 
-st.title("Fratelli Crédito 4.5")
-st.caption("Motor de crédito B2B 4.7 — dados ausentes recebem 25% da pontuação do critério; o limite financeiro é separado da exposição atual.")
+st.markdown("""
+<style>
+.fratelli-header {
+    display:flex; align-items:center; gap:28px;
+    padding:8px 0 18px 0;
+    border-bottom:1px solid rgba(49,51,63,.12);
+    margin-bottom:18px;
+}
+.fratelli-header img {
+    width:220px; max-height:78px; object-fit:contain; object-position:left center;
+}
+.fratelli-title {
+    font-size:2.15rem; font-weight:750; line-height:1.05; color:#30313d;
+}
+.fratelli-subtitle {
+    margin-top:6px; font-size:1rem; color:#7a7d86;
+}
+@media (max-width: 700px) {
+  .fratelli-header {flex-direction:column; align-items:flex-start; gap:10px;}
+  .fratelli-header img {width:190px;}
+}
+</style>
+""", unsafe_allow_html=True)
+
+if LOGO.exists():
+    st.markdown(
+        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli Crédito 4.7</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.</div></div></div>',
+        unsafe_allow_html=True
+    )
+else:
+    st.title("Fratelli Crédito 4.7")
+    st.caption("Motor de crédito B2B — análise conservadora, explicável e sem dependência de APIs externas.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
@@ -690,7 +727,7 @@ if menu == "Nova análise":
         sim_pedido = st.number_input(
             "Valor financeiro simulado do pedido (R$)",
             min_value=0.0, value=float(pedido or 0), step=100.0,
-            key="sim_pedido_44"
+            key="sim_pedido_47"
         )
         sim_decisao, sim_aprovado = order_decision(
             disponivel, sim_pedido, gate, risco
