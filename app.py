@@ -1,8 +1,10 @@
 import sqlite3
 import json
 import math
-import urllib.parse
-import webbrowser
+import re
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import quote
 from datetime import datetime, date
 from pathlib import Path
 
@@ -40,6 +42,110 @@ SEGMENT_FACTORS = {
     "Hotel": 0.07,
     "Outro": 0.05,
 }
+
+
+PUBLIC_SOURCES = [
+    ("CNPJ.BIZ", "https://cnpj.biz/{cnpj}"),
+    ("CNPJ.ai", "https://cnpj.ai/{cnpj}"),
+    ("BuscaSim", "https://buscasim.com.br/cnpj/{cnpj}-COMERCIAL-GAMA"),
+    ("Serasa Empresas", "https://empresas.serasaexperian.com.br/consulta-gratis/LILIAN-KARLEY-SANTOS-GAMA-LTDA-{cnpj}"),
+    ("CNPJCheck", "https://cnpjcheck.com.br/empresa/lilian-karley-santos-gama-ltda-comercial-gama-{cnpj}"),
+    ("CadastroEmpresa", "https://cadastroempresa.com.br/fornecedor/lilian-karley-santos-gama-{cnpj}"),
+]
+
+def fetch_public_page(url, source):
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0 (compatible; FratelliCredito/5.1)"})
+        if r.status_code >= 400:
+            return {"source":source,"url":url,"ok":False,"status":r.status_code,"text":""}
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script","style","noscript"]): tag.decompose()
+        text = " ".join(soup.stripped_strings)
+        return {"source":source,"url":url,"ok":True,"status":r.status_code,"text":text[:250000]}
+    except Exception as e:
+        return {"source":source,"url":url,"ok":False,"status":None,"text":"","error":str(e)}
+
+def first_match(text, patterns):
+    for pat in patterns:
+        m=re.search(pat,text,re.I)
+        if m:
+            return re.sub(r'\s+',' ',m.group(1)).strip(' |:')
+    return None
+
+def parse_public_cnpj_page(page):
+    text=page.get("text","")
+    fields={}
+    fields["Razão social"]=first_match(text,[r"Razão Social\s*[:|]?\s*([^|]{3,100}?)(?=\s+Nome Fantasia|\s+Data da Abertura|\s+CNPJ)",r"Razão social\s*[:|]?\s*([^|]{3,100}?)(?=\s+Nome fantasia)"])
+    fields["Nome fantasia"]=first_match(text,[r"Nome Fantasia\s*[:|]?\s*([^|]{2,100}?)(?=\s+Data da Abertura|\s+Porte|\s+CNPJ)",r"Nome fantasia\s*[:|]?\s*([^|]{2,100}?)(?=\s+Data)"])
+    fields["Data de abertura"]=first_match(text,[r"Data da Abertura\s*[:|]?\s*(\d{2}/\d{2}/\d{4})",r"Data de abertura\s*[:|]?\s*(\d{2}/\d{2}/\d{4})"])
+    fields["Situação cadastral"]=first_match(text,[r"Situação Cadastral\s*[:|]?\s*([A-ZÁÉÍÓÚÇÃÕ ]{4,30})(?=\s+Data|\s+Capital|\s+Natureza)",r"Situação\s*[:|]?\s*(ATIVA|INATIVA|BAIXADA|SUSPENSA|INAPTA)"])
+    fields["Natureza jurídica"]=first_match(text,[r"Natureza Jurídica\s*[:|]?\s*([^|]{5,100}?)(?=\s+Opção|\s+Capital|\s+Tipo)",r"natureza jurídica\s+([^|]{5,100}?)(?=\s+Matriz)"])
+    fields["Capital social"]=first_match(text,[r"Capital Social\s*[:|]?\s*(R\$\s*[0-9\.\,]+)",r"capital social\s+(R\$\s*[0-9\.\,]+)"])
+    fields["Porte"]=first_match(text,[r"Porte\s*[:|]?\s*([^|]{2,40})(?=\s+Natureza|\s+Capital|\s+Tipo)"])
+    fields["CNAE principal"]=first_match(text,[r"Principal\s*[:|]?\s*([0-9]{2}\.?[0-9]{2}-?[0-9]/?[0-9]{2})\s*-\s*([^|]{5,120}?)(?=\s+Atividades|\s+Descritores|\s+Sobre)"])
+    if fields["CNAE principal"] is None:
+        fields["CNAE principal"]=first_match(text,[r"CNAE principal\s*[:|]?\s*([0-9\.\-/]+\s*-\s*[^|]{5,120})"])
+    fields["Endereço"]=first_match(text,[r"Logradouro\s*[:|]?\s*([^|]{5,150}?)(?=\s+Bairro|\s+CEP|\s+Município)"])
+    fields["Bairro"]=first_match(text,[r"Bairro\s*[:|]?\s*([^|]{2,80})(?=\s+CEP|\s+Município|\s+Estado)"])
+    fields["Município/UF"]=first_match(text,[r"Município\s*[:|]?\s*([^|]{2,100}?)(?=\s+Estado|\s+Para correspondência|\s+Atividades)",r"Município\s*/\s*UF\s*[:|]?\s*([^|]{2,100})"])
+    fields["CEP"]=first_match(text,[r"CEP\s*[:|]?\s*(\d{5}-\d{3})"])
+    fields["Telefone"]=first_match(text,[r"Telefone\s*[:|]?\s*(\(\d{2}\)\s*[0-9\-\* ]{7,20})"])
+    fields={k:v for k,v in fields.items() if v}
+    partners=[]
+    for m in re.finditer(r"(?:Sócio-Administrador|Sócio\s+Administrador|Sócio)\s+([A-ZÁÉÍÓÚÇÃÕ][A-ZÁÉÍÓÚÇÃÕ ]{5,80})", text):
+        n=m.group(1).strip()
+        if len(n.split())>=2 and n not in partners: partners.append(n)
+    # common explicit name pattern on sources
+    if not partners:
+        for pat in [r"Nome\s+\|\s+Tipo\s+\|\s+Qualificação.*?\n?([A-ZÁÉÍÓÚÇÃÕ][A-ZÁÉÍÓÚÇÃÕ ]{5,80})", r"Quadro Societário.*?([A-ZÁÉÍÓÚÇÃÕ][A-ZÁÉÍÓÚÇÃÕ ]{5,80})"]:
+            m=re.search(pat,text,re.I|re.S)
+            if m:
+                n=m.group(1).strip()
+                if len(n.split())>=2: partners.append(n)
+    return fields, list(dict.fromkeys(partners))
+
+def build_public_dossier(cnpj):
+    c=clean_cnpj(cnpj)
+    if len(c)!=14: return {"ok":False,"message":"Informe um CNPJ com 14 dígitos.","sources":[],"fields":{},"partners":[],"conflicts":[]}
+    pages=[]
+    # The URLs are public pages, not APIs. Some sources can block automated access; failures remain visible.
+    for source,template in PUBLIC_SOURCES:
+        url=template.format(cnpj=c)
+        # Generic source URLs are safer when the name is unknown; use only the CNPJ-specific endpoints here.
+        if source in {"BuscaSim","Serasa Empresas","CNPJCheck","CadastroEmpresa"}:
+            continue
+        pages.append(fetch_public_page(url,source))
+    # Public search pages are used only to surface discoverable evidence.
+    # They are not treated as authoritative proof of debt, process, or identity.
+    search_queries=[c]
+    for q in search_queries:
+        url="https://html.duckduckgo.com/html/?q="+quote(q+" empresa CNPJ processos")
+        pages.append(fetch_public_page(url,"Busca pública — CNPJ/processos"))
+    source_rows=[]; values={}; partners=[]
+    for p in pages:
+        if p.get("ok"):
+            fields,ps=parse_public_cnpj_page(p)
+            p["fields"]=fields; p["partners"]=ps
+            for k,v in fields.items(): values.setdefault(k,[]).append((p["source"],v))
+            partners.extend(ps)
+        source_rows.append(p)
+    conflicts=[]; consolidated={}
+    for k,vals in values.items():
+        norm={re.sub(r'\s+',' ',v.strip().upper()) for _,v in vals}
+        if len(norm)>1:
+            conflicts.append({"campo":k,"valores":vals})
+        # majority value; ties use first source. We never hide conflicting values.
+        counts={}
+        for src,v in vals: counts[v]=counts.get(v,0)+1
+        consolidated[k]=max(vals,key=lambda x:counts[x[1]])[1]
+    partners=list(dict.fromkeys([p for p in partners if p and len(p.split())>=2]))
+    # Search public web for each identified partner name. Results are shown as leads only.
+    for partner in partners[:5]:
+        qurl="https://html.duckduckgo.com/html/?q="+quote('"'+partner+'" processos empresa')
+        pp=fetch_public_page(qurl,"Busca pública — sócio/administrador")
+        pp["query_name"]=partner
+        source_rows.append(pp)
+    return {"ok":True,"queried_at":datetime.now().isoformat(timespec="seconds"),"sources":source_rows,"fields":consolidated,"field_sources":values,"partners":partners,"conflicts":conflicts}
 
 def db():
     con = sqlite3.connect(DB)
@@ -85,17 +191,6 @@ def db():
         depois TEXT,
         motivo TEXT
     )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS pesquisas_publicas(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        cliente_id INTEGER,
-        data TEXT,
-        alvo TEXT,
-        nome TEXT,
-        fonte TEXT,
-        resultado TEXT,
-        observacao TEXT,
-        url TEXT
-    )""")
     # Migração leve: mantém bancos 4.x existentes sem exigir API ou reinstalação.
     cols = {r[1] for r in con.execute("PRAGMA table_info(movimentos)").fetchall()}
     if "data_pagamento" not in cols:
@@ -133,7 +228,7 @@ def cnpj_validate_local(cnpj):
     if nums[12] != d1 or nums[13] != d2:
         return None, "CNPJ inválido: dígitos verificadores não conferem."
     formatted = f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
-    return {"cnpj": digits, "cnpj_formatted": formatted}, "CNPJ válido matematicamente. Nenhuma consulta automática foi realizada nesta validação local. Confirme manualmente razão social, situação cadastral e demais dados."
+    return {"cnpj": digits, "cnpj_formatted": formatted}, "CNPJ válido matematicamente. Nenhuma consulta externa foi realizada. Confirme manualmente razão social, situação cadastral e demais dados."
 
 def score_cadastro(situacao, anos):
     vals = []
@@ -307,56 +402,12 @@ def data_quality_label(coverage, verified_sources):
 
 
 
-def public_search_urls(cnpj, name=""):
-    q_cnpj = clean_cnpj(cnpj)
-    q = name.strip() or q_cnpj
-    enc = urllib.parse.quote_plus(q)
-    enc_processos = urllib.parse.quote_plus(f'"{q}" processos')
-    enc_restricoes = urllib.parse.quote_plus(f'"{q}" protesto OR sanção OR insolvência')
-    return [
-        ("Google — pesquisa geral", f"https://www.google.com/search?q={enc}"),
-        ("Google — processos/restrições", f"https://www.google.com/search?q={enc_restricoes}"),
-        ("Jusbrasil — pesquisa processual", f"https://www.jusbrasil.com.br/busca?q={enc_processos}"),
-        ("Serasa — consulta CNPJ", f"https://empresas.serasaexperian.com.br/consulta-gratis/{q_cnpj}" if q_cnpj else "https://empresas.serasaexperian.com.br/"),
-        ("CNPJ.biz — cadastro público", f"https://cnpj.biz/{q_cnpj}" if q_cnpj else "https://cnpj.biz/"),
-    ]
-
-def render_public_research(cnpj, owner_names):
-    st.subheader("Consulta externa e sinais públicos")
-    st.warning("Esta área faz pesquisa pública assistida. Ela não consulta bases privadas de crédito, não revela dívidas privadas e não transforma resultados de busca em fatos automaticamente. Registre somente o que você confirmar na fonte.")
-    if cnpj:
-        st.markdown("**Empresa / CNPJ**")
-        for label, url in public_search_urls(cnpj):
-            st.link_button(label, url, use_container_width=False)
-    names=[n.strip() for n in owner_names if n.strip()]
-    if names:
-        st.markdown("**Sócios/administradores — triagem pública**")
-        st.caption("A pesquisa de pessoas é limitada a fontes públicas e sinais empresariais/judiciais relevantes. Não use esta área para inferir dívida privada, renda, saúde ou outros dados sensíveis.")
-        for name in names:
-            st.write(f"**{name}**")
-            for label, url in public_search_urls("", name):
-                st.link_button(label, url, use_container_width=False)
-
-def save_public_finding(con, cliente_id, alvo, nome, fonte, resultado, observacao, url):
-    cur=con.cursor()
-    cur.execute("INSERT INTO pesquisas_publicas(cliente_id,data,alvo,nome,fonte,resultado,observacao,url) VALUES(?,?,?,?,?,?,?,?)",
-                (cliente_id, datetime.now().isoformat(), alvo, nome, fonte, resultado, observacao, url))
-    con.commit()
-    audit(con,"CRIAR","pesquisa_publica",cur.lastrowid,"",{"alvo":alvo,"nome":nome,"resultado":resultado,"fonte":fonte},"Registro de pesquisa pública confirmado pelo operador")
-    return cur.lastrowid
-
 def audit(con, action, entity, entity_id=None, before="", after="", reason=""):
     con.execute("""INSERT INTO auditoria(data,usuario,acao,entidade,entidade_id,antes,depois,motivo)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (datetime.now().isoformat(), "operador", action, entity, entity_id,
                  str(before), str(after), str(reason)))
     con.commit()
-
-def public_findings_for_cnpj(con, cnpj):
-    cid=con.execute("SELECT id FROM clientes WHERE cnpj=?", (clean_cnpj(cnpj),)).fetchone()
-    if not cid:
-        return pd.DataFrame()
-    return pd.read_sql_query("SELECT * FROM pesquisas_publicas WHERE cliente_id=? ORDER BY id DESC", con, params=(cid[0],))
 
 def client_movements(con, client_id):
     return pd.read_sql_query(
@@ -609,7 +660,7 @@ def pdf_report(data, path):
         except Exception:
             pass
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(45,y,"Fratelli Crédito")
+    c.drawString(45,y,"Fratelli")
     y -= 30
     c.setFont("Helvetica",10)
     for label, value in data:
@@ -621,6 +672,12 @@ def pdf_report(data, path):
     return True
 
 con = db()
+
+# Identidade Fratelli no menu lateral
+if LOGO.exists():
+    import base64
+    _logo_b64 = base64.b64encode(LOGO.read_bytes()).decode()
+    st.sidebar.markdown(f'<div style="text-align:center;padding:4px 0 16px"><img src="data:image/png;base64,{_logo_b64}" style="max-width:170px;max-height:72px;object-fit:contain"></div>', unsafe_allow_html=True)
 
 st.markdown("""
 <style>
@@ -648,17 +705,14 @@ st.markdown("""
 
 if LOGO.exists():
     st.markdown(
-        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli</div><div class="fratelli-subtitle">Motor de crédito B2B — análise conservadora, explicável e com pesquisa pública assistida.</div></div></div>',
+        f'<div class="fratelli-header"><img src="data:image/png;base64,{__import__("base64").b64encode(LOGO.read_bytes()).decode()}"><div><div class="fratelli-title">Fratelli</div><div class="fratelli-subtitle">Análise e decisão de crédito B2B — evidências públicas, dados internos e decisão explicável.</div></div></div>',
         unsafe_allow_html=True
     )
 else:
     st.title("Fratelli")
-    st.caption("Motor de crédito B2B — análise conservadora, explicável e com pesquisa pública assistida.")
+    st.caption("Análise e decisão de crédito B2B — evidências públicas, dados internos e decisão explicável.")
 
-if LOGO.exists():
-    st.sidebar.image(str(LOGO), width=185)
-st.sidebar.caption("Crédito B2B")
-menu = st.sidebar.radio("Menu", ["Nova análise", "Pesquisa pública", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
+menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
 if menu == "Nova análise":
     st.subheader("1. Cadastro da empresa")
@@ -671,26 +725,56 @@ if menu == "Nova análise":
             (st.success if data else st.error)(msg)
         elif cnpj and len(clean_cnpj(cnpj)) == 14:
             st.caption("Validação disponível: clique em **Validar CNPJ**. Esta função é local e não consulta nenhuma API.")
+    # Pesquisa pública do cliente: traz os dados para dentro do sistema, não apenas links.
+    with st.expander("🔎 Dossiê público do cliente", expanded=True):
+        st.caption("Pesquisa em páginas públicas disponíveis na internet. Não usa API de crédito. Cada fonte é exibida separadamente e divergências não são ocultadas.")
+        if st.button("Pesquisar dados públicos agora", key="pesquisar_publico_51"):
+            with st.spinner("Consultando fontes públicas..."):
+                st.session_state["public_dossier"] = build_public_dossier(cnpj)
+        dossier=st.session_state.get("public_dossier")
+        if dossier and dossier.get("ok"):
+            st.success(f"Pesquisa concluída em {dossier.get('queried_at','')}. Fontes respondidas: {sum(1 for x in dossier['sources'] if x.get('ok'))}/{len(dossier['sources'])}.")
+            flds=dossier.get("fields",{})
+            if flds:
+                rows=[]
+                for k,v in flds.items():
+                    srcs="; ".join(src for src,_ in dossier.get("field_sources",{}).get(k,[]))
+                    rows.append({"Campo":k,"Valor consolidado":v,"Fontes":srcs})
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            if dossier.get("conflicts"):
+                st.warning("DIVERGÊNCIAS ENTRE FONTES — o sistema não escolhe silenciosamente uma versão.")
+                for cfl in dossier["conflicts"]:
+                    st.write(f"**{cfl['campo']}**")
+                    st.dataframe(pd.DataFrame([{"Fonte":s,"Valor":v} for s,v in cfl["valores"]]), use_container_width=True, hide_index=True)
+            if dossier.get("partners"):
+                st.markdown("### Sócios/administradores encontrados")
+                for partner in dossier["partners"]:
+                    st.write(f"• {partner}")
+                    st.caption("Pesquisa de nome deve ser tratada como evidência pública potencial; homônimos exigem confirmação de identidade.")
+                    purl="https://www.jusbrasil.com.br/busca?q="+quote(partner)
+                    st.markdown(f"Pesquisa pública do nome: {purl}")
+            st.markdown("### Fontes consultadas")
+            for src in dossier["sources"]:
+                status="OK" if src.get("ok") else "SEM RESPOSTA"
+                st.write(f"**{src['source']} — {status}** | {src['url']}")
+                if src.get("ok"):
+                    snippet=src.get("text","")[:500]
+                    st.caption(snippet+('…' if len(src.get('text',''))>500 else ''))
+            st.info("Importante: ausência de resultado em uma página pública não significa ausência de dívida, protesto ou processo. Consultas privadas/creditícias detalhadas só entram como evidência se houver fonte autorizada ou documento fornecido pelo usuário.")
+        elif dossier and not dossier.get("ok"):
+            st.error(dossier.get("message","Não foi possível concluir a pesquisa."))
+
     data = st.session_state.get("cnpj_data") or {}
+    dossier=st.session_state.get("public_dossier") or {}
+    public_fields=dossier.get("fields",{}) if dossier else {}
     with c2:
-        razao = st.text_input("Razão social", value=data.get("razao_social",""))
-        fantasia = st.text_input("Nome fantasia", value=data.get("nome_fantasia",""))
+        razao = st.text_input("Razão social", value=data.get("razao_social", public_fields.get("Razão social", "")))
+        fantasia = st.text_input("Nome fantasia", value=data.get("nome_fantasia", public_fields.get("Nome fantasia", "")))
     with c3:
         segmento = st.selectbox("Segmento", list(SEGMENT_FACTORS.keys()))
         situacao_manual = st.selectbox("Situação cadastral confirmada", ["Não informado","ATIVA/REGULAR","SUSPENSA/INAPTA","Outra situação"])
         anos_atividade_manual = st.number_input("Anos de atividade confirmados", min_value=0.0, step=1.0, value=0.0)
         cadastro_confirmado = st.checkbox("Cadastro/documentação conferidos pelo operador", value=False)
-
-    st.markdown("### Sócios e administradores")
-    st.caption("Informe os nomes exatamente como aparecem nos documentos/consulta cadastral. O sistema permitirá abrir pesquisas públicas sobre cada nome.")
-    o1,o2,o3 = st.columns(3)
-    with o1: socio_1 = st.text_input("Sócio/administrador 1")
-    with o2: socio_2 = st.text_input("Sócio/administrador 2")
-    with o3: socio_3 = st.text_input("Sócio/administrador 3")
-    owner_names = [socio_1, socio_2, socio_3]
-
-    with st.expander("Pesquisa pública da empresa e dos sócios", expanded=False):
-        render_public_research(cnpj, owner_names)
 
     st.subheader("2. Capacidade financeira e solicitação do cliente")
     a,b,c,d = st.columns(4)
@@ -799,6 +883,10 @@ if menu == "Nova análise":
     if faturamento > 0 and fonte in ("Documento financeiro","Fonte financeira autorizada"): verified_sources += 1
     if tem_historico: verified_sources += 1
     if tem_restricoes: verified_sources += 1
+    public_ok = bool(dossier.get("ok")) if dossier else False
+    public_sources_ok = sum(1 for x in dossier.get("sources",[]) if x.get("ok")) if dossier else 0
+    public_conflicts = len(dossier.get("conflicts",[])) if dossier else 0
+    if public_ok and public_sources_ok >= 2: verified_sources += 1
     quality = data_quality_label(cobertura, verified_sources)
     inconsistencias = contradiction_checks(data, faturamento, pedido, aberto, limite_atual, real)
 
@@ -860,6 +948,21 @@ if menu == "Nova análise":
 
 
     st.divider()
+    st.subheader("3A. Informações públicas encontradas")
+    if public_ok:
+        pp1,pp2,pp3,pp4=st.columns(4)
+        pp1.metric("Fontes respondidas", public_sources_ok)
+        pp2.metric("Campos públicos", len(public_fields))
+        pp3.metric("Sócios encontrados", len(dossier.get("partners",[])))
+        pp4.metric("Divergências", public_conflicts)
+        if public_conflicts:
+            st.warning("Há divergências cadastrais entre fontes públicas. Isso reduz a confiabilidade da análise e exige confirmação documental.")
+        else:
+            st.success("As fontes públicas consultadas não apresentaram divergências nos campos extraídos automaticamente.")
+    else:
+        st.info("Nenhuma pesquisa pública foi carregada nesta análise. Clique em 'Pesquisar dados públicos agora' para trazer os dados disponíveis.")
+
+    st.divider()
     st.subheader("4. Central de decisão")
     # Decision card first: user should not have to interpret several lines to know what to do.
     if score is not None and score < 25:
@@ -891,6 +994,8 @@ if menu == "Nova análise":
     st.write(f"**Controle de decisão:** {gate} — {gate_reason}")
     if inconsistencias:
         st.warning("**Inconsistências para revisão:** " + " | ".join(inconsistencias))
+    if public_conflicts:
+        st.warning(f"**Divergências públicas:** {public_conflicts} campo(s) possuem valores diferentes entre as fontes consultadas.")
 
     st.write(f"**Limite comercial por score:** {money(policy_ceiling)}")
     st.write(f"**Limite financeiro calculado:** {money(capacidade_limite)}")
@@ -992,33 +1097,6 @@ if menu == "Nova análise":
             with open(pdf,"rb") as f:
                 st.download_button("Baixar relatório PDF",f,file_name=pdf.name)
 
-elif menu == "Pesquisa pública":
-    st.subheader("Pesquisa pública")
-    st.markdown("Use esta área para consultar fontes abertas e registrar somente resultados que você confirmar. O sistema não chama API privada nem afirma que encontrou uma dívida só porque uma busca não retornou resultados.")
-    pc = st.text_input("CNPJ")
-    pnames = st.text_area("Sócios/administradores — um por linha")
-    names = [x.strip() for x in pnames.splitlines() if x.strip()]
-    render_public_research(pc, names)
-    st.divider()
-    st.markdown("### Registrar resultado confirmado")
-    alvo = st.selectbox("Alvo", ["Empresa", "Sócio/administrador"])
-    nome_alvo = st.text_input("Nome do alvo", value=(names[0] if names else ""))
-    fonte_p = st.text_input("Fonte consultada")
-    resultado_p = st.selectbox("Resultado", ["Sem apontamento público confirmado", "Apontamento público confirmado", "Inconclusivo / requer revisão"])
-    url_p = st.text_input("URL da fonte")
-    obs_p = st.text_area("Observação objetiva", help="Descreva apenas o que a fonte efetivamente mostra.")
-    if st.button("Registrar resultado público"):
-        cnpj_reg=clean_cnpj(pc)
-        cid_row=con.execute("SELECT id FROM clientes WHERE cnpj=?", (cnpj_reg,)).fetchone() if cnpj_reg else None
-        cid=cid_row[0] if cid_row else None
-        fid=save_public_finding(con,cid,alvo,nome_alvo,fonte_p,resultado_p,obs_p,url_p)
-        st.success(f"Resultado público registrado #{fid}.")
-    if pc:
-        fdf=public_findings_for_cnpj(con, pc)
-        if not fdf.empty:
-            st.markdown("### Resultados públicos já registrados")
-            st.dataframe(fdf[["data","alvo","nome","fonte","resultado","observacao","url"]], use_container_width=True)
-
 elif menu == "Histórico real":
     st.subheader("Histórico real de clientes")
     clients = pd.read_sql_query("SELECT id, cnpj, razao FROM clientes ORDER BY razao", con)
@@ -1076,14 +1154,10 @@ elif menu == "Clientes":
     st.subheader("Clientes cadastrados")
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
-elif menu == "Auditoria":
-    st.subheader("Trilha de auditoria")
-    df = pd.read_sql_query("SELECT * FROM auditoria ORDER BY id DESC", con)
-    st.dataframe(df, use_container_width=True)
 else:
     st.subheader("Metodologia")
     st.markdown("""
-**Regra central 4.7:** informação ausente não é excluída do cálculo. Quando um critério relevante não possui evidência suficiente, ele recebe **25% da pontuação máxima daquele critério**. Isso reduz o score e impede que a falta de informação favoreça o cliente.
+**Regra central:** informação ausente não é excluída do cálculo. Quando um critério relevante não possui evidência suficiente, ele recebe **25% da pontuação máxima daquele critério**. Isso reduz o score e impede que a falta de informação favoreça o cliente.
 
 **Pesos**
 - Cadastro e estabilidade: 20%
@@ -1112,15 +1186,13 @@ else:
 
 **Qualidade dos dados:** cada análise recebe uma classificação de qualidade com base na cobertura e na quantidade de fontes verificadas.
 
-**Ausência de informação 4.8:** cada critério sem evidência suficiente recebe 25% da pontuação máxima. A ausência nunca vira pontuação positiva nem é removida do denominador.
+**Ausência de informação:** cada critério sem evidência suficiente recebe 25% da pontuação máxima. A ausência nunca vira pontuação positiva nem é removida do denominador.
 
-**Política comercial por score 4.8:** abaixo de 25 = não vender; 25 a <35 = até R$ 1.500; 35 a <45 = até R$ 5.000; 45 a <55 = até R$ 10.000; 55 a 70 = até R$ 20.000; acima de 70 = valor solicitado pelo cliente, sempre sujeito aos controles de exposição/capacidade e aos gates de segurança.
+**Política comercial por score:** abaixo de 25 = não vender; 25 a <35 = até R$ 1.500; 35 a <45 = até R$ 5.000; 45 a <55 = até R$ 10.000; 55 a 70 = até R$ 20.000; acima de 70 = valor solicitado pelo cliente, sempre sujeito aos controles de exposição/capacidade e aos gates de segurança.
 
 **Solicitação do cliente:** o valor pedido é um dado independente e é comparado explicitamente com o teto da política. A quantidade de caixas também pode ser informada; cada caixa representa 9 garrafas e o valor é calculado antes da decisão.
 
 **Decisão:** a Central de decisão apresenta primeiro uma instrução operacional clara: NÃO VENDER, NÃO APROVAR, APROVAÇÃO PARCIAL, APROVAR ATÉ X ou revisão manual. O score não é tratado como aprovação automática quando os gates de segurança não são atendidos.
-
-**Pesquisa pública:** o sistema gera pesquisas assistidas para CNPJ e sócios/administradores em fontes abertas. Resultados negativos só entram como evidência quando o operador confirma a fonte e registra a observação. Ausência de resultado não significa ausência de dívida. Consultas privadas de crédito exigem relatório/documento fornecido e autorizado.
 
 **Princípio de explicabilidade:** toda decisão mostra score, cobertura, qualidade, limite, exposição, utilização, inconsistências, dados usados, critérios penalizados e motivo da decisão.
 
