@@ -19,7 +19,7 @@ APP_DIR = Path(__file__).parent
 DB = APP_DIR / "fratelli_credito.db"
 LOGO = APP_DIR / "assets" / "fratelli_logo.png"
 
-st.set_page_config(page_title="Fratelli Crédito 4.5", page_icon="💳", layout="wide")
+st.set_page_config(page_title="Fratelli Crédito 4.7", page_icon="💳", layout="wide")
 
 WEIGHTS = {
     "Cadastro e estabilidade": 20,
@@ -178,13 +178,26 @@ def score_operacional(restricoes, fonte_restricoes):
         return None
     return 100 if restricoes == 0 else 55 if restricoes <= 2 else 20
 
+MISSING_SCORE_FACTOR = 0.25
+
 def calc_score(items):
+    """Calcula score com penalização conservadora por ausência de evidência.
+
+    Critério informado: usa a pontuação efetivamente calculada.
+    Critério sem informação suficiente: recebe 25% da pontuação máxima (25/100).
+    Cobertura continua sendo reportada separadamente e não é usada para
+    renormalizar o score, evitando que poucos dados favoráveis produzam um
+    resultado artificialmente alto.
+    """
     total_weight = sum(WEIGHTS.values())
     used = sum(WEIGHTS[k] for k,v in items.items() if v is not None)
-    if used == 0:
-        return None, 0
-    score = sum(WEIGHTS[k]*v for k,v in items.items() if v is not None) / used
-    return round(score, 1), round(used/total_weight*100, 1)
+    missing = [k for k,v in items.items() if v is None]
+    score = sum(
+        WEIGHTS[k] * (MISSING_SCORE_FACTOR * 100 if v is None else v)
+        for k,v in items.items()
+    ) / total_weight
+    coverage = round(used/total_weight*100, 1)
+    return round(score, 1), coverage, missing
 
 def risk(score, situacao, maior_atraso):
     if score is None:
@@ -480,7 +493,7 @@ def pdf_report(data, path):
 con = db()
 
 st.title("Fratelli Crédito 4.5")
-st.caption("Motor de crédito B2B — dados ausentes são excluídos do cálculo; o limite financeiro é separado da exposição atual.")
+st.caption("Motor de crédito B2B 4.7 — dados ausentes recebem 25% da pontuação do critério; o limite financeiro é separado da exposição atual.")
 
 menu = st.sidebar.radio("Menu", ["Nova análise", "Histórico real", "Histórico", "Clientes", "Auditoria", "Metodologia"])
 
@@ -581,7 +594,7 @@ if menu == "Nova análise":
             restricoes if tem_restricoes else None, fonte
         ),
     }
-    score,cobertura = calc_score(itens)
+    score,cobertura,criterios_sem_evidencia = calc_score(itens)
 
     verified_sources = 0
     if data: verified_sources += 1
@@ -659,6 +672,12 @@ if menu == "Nova análise":
         st.write(f"**Utilização antes do pedido:** {motor['utilization_before']:.1f}%")
         st.write(f"**Utilização após o pedido:** {motor['utilization_after']:.1f}%")
     st.caption(f"Motor de limite: {limite_motivo}")
+    if criterios_sem_evidencia:
+        st.warning(
+            "**Penalização por ausência de informação:** "
+            + "; ".join(f"{c}: 25%" for c in criterios_sem_evidencia)
+            + ". Esses critérios contribuíram com somente 25% da pontuação máxima."
+        )
     st.write(f"**Decisão financeira:** {decisao_financeira}")
     st.write(f"**Condição sugerida:** {prazo}  |  **Entrada:** {money(entrada)}")
     st.write(f"**Decisão final:** {decisao}")
@@ -683,10 +702,18 @@ if menu == "Nova análise":
 
     with st.expander("Ver composição do score"):
         for k,v in itens.items():
-            st.write(f"**{k}** — {'N/D' if v is None else f'{v:.1f}/100'} — peso {WEIGHTS[k]}%")
+            st.write(
+                f"**{k}** — "
+                + (f"25.0/100 (ausência de evidência; 25%)" if v is None else f"{v:.1f}/100")
+                + f" — peso {WEIGHTS[k]}%"
+            )
 
     justificativas = []
-    if score is None: justificativas.append("Não há dados suficientes para classificar o risco.")
+    if criterios_sem_evidencia:
+        justificativas.append(
+            "Critérios sem evidência receberam somente 25% da pontuação máxima: "
+            + ", ".join(criterios_sem_evidencia) + "."
+        )
     if faturamento <= 0: justificativas.append("Sem faturamento informado/comprovado, não foi calculado limite por capacidade.")
     if fonte == "Declaração do cliente": justificativas.append("Faturamento declarado recebeu confiança menor que documentação financeira.")
     if tem_restricoes and restricoes > 0: justificativas.append(f"Foram informadas {restricoes} restrição(ões)/protesto(s) confirmado(s).")
@@ -790,9 +817,9 @@ elif menu == "Clientes":
     df = pd.read_sql_query("SELECT * FROM clientes ORDER BY id DESC", con)
     st.dataframe(df, use_container_width=True)
 else:
-    st.subheader("Metodologia 4.5")
+    st.subheader("Metodologia 4.7")
     st.markdown("""
-**Regra central:** informação ausente não é boa nem ruim. Ela é excluída do cálculo.
+**Regra central 4.7:** informação ausente não é excluída do cálculo. Quando um critério relevante não possui evidência suficiente, ele recebe **25% da pontuação máxima daquele critério**. Isso reduz o score e impede que a falta de informação favoreça o cliente.
 
 **Pesos**
 - Cadastro e estabilidade: 20%
@@ -801,7 +828,7 @@ else:
 - Exposição: 15%
 - Comportamento operacional: 10%
 
-**Cobertura:** mostra quanto da política total pôde ser efetivamente analisado.
+**Cobertura:** mostra quanto da política total possui evidência suficiente. Ela não aumenta o score; serve como indicador independente de qualidade e governança.
 
 **Faturamento:** a fonte é identificada. Declaração do cliente não é tratada como equivalente a documento financeiro.
 
@@ -821,6 +848,8 @@ else:
 
 **Qualidade dos dados:** cada análise recebe uma classificação de qualidade com base na cobertura e na quantidade de fontes verificadas.
 
-**Princípio de explicabilidade:** toda decisão mostra score, cobertura, qualidade, limite, exposição, utilização, inconsistências, dados usados e motivo da decisão. Nenhuma ausência de informação é convertida em ponto positivo ou negativo.
+**Ausência de informação 4.7:** cada critério sem evidência suficiente recebe 25% da pontuação máxima. A ausência nunca vira pontuação positiva nem é removida do denominador.
+
+**Princípio de explicabilidade:** toda decisão mostra score, cobertura, qualidade, limite, exposição, utilização, inconsistências, dados usados, critérios penalizados e motivo da decisão.
 
 """)
